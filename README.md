@@ -78,7 +78,8 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 If went wrong in Activating virtuel environement, try this command line before activating:
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
 
 ### 2. Configure API keys
 
