@@ -1,0 +1,23 @@
+python-pptx>=1.0.2
+python-dotenv>=1.0.1
+streamlit>=1.40.0
+pydantic>=2.9.0
+tzdata>=2024.1
+
+# LangChain agent + DeepSeek function calling
+langchain>=1.0.2
+langchain-core>=0.3.72
+langgraph>=0.4.0
+langchain-deepseek>=0.1.4
+langchain-text-splitters>=0.3.9
+
+# Local vector store (no cloud)
+langchain-chroma>=0.2.3
+chromadb>=0.5.23
+
+# Multilingual embeddings for Traditional Chinese (local, no extra API key)
+langchain-huggingface>=0.3.0
+sentence-transformers>=3.3.1
+
+# Web search tool
+langchain-tavily>=0.2.4

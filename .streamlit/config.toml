@@ -1,0 +1,9 @@
+[server]
+# transformers + sentence-transformers register hundreds of vision modules.
+# Streamlit's file watcher inspects them and crashes on missing torchvision,
+# which floods the terminal and delays the first page load.
+fileWatcherType = "none"
+headless = false
+
+[browser]
+gatherUsageStats = false
