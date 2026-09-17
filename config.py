@@ -20,6 +20,10 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 # so we embed Traditional Chinese text locally and keep original wording.
 EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+# Official Hong Kong Labour Department press-release listing (layer 2 after local RAG).
+LABOUR_DEPT_NEWS_URL = "https://www.labour.gov.hk/tc/major/content.php"
+LABOUR_DEPT_DOMAINS = ("labour.gov.hk", "www.labour.gov.hk")
+
 # Hong Kong local date is used for "today" (MM-DD matching).
 HONG_KONG_TZ = "Asia/Hong_Kong"
 

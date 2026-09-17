@@ -2,14 +2,14 @@
 
 A LangChain agent that posts a **daily workplace safety alert** in Traditional Chinese.
 
-It first looks up working accidents that happened on the same month-day (`MM-DD`) in a local RAG knowledge base built from four Traditional Chinese PowerPoint newspaper-cutting decks. If nothing is found, it falls back to Tavily web search (Hong Kong workplace accidents → world workplace accidents → historical facts). Users can click the alert and ask follow-up questions.
+It first looks up working accidents that happened on the same month-day (`MM-DD`) in a local RAG knowledge base built from four Traditional Chinese PowerPoint newspaper-cutting decks. If nothing is found, it searches the [Hong Kong Labour Department press-release list](https://www.labour.gov.hk/tc/major/content.php), then falls back to worldwide workplace accidents, then historical facts.
 
 ## Architecture
 
 | Layer | Choice |
 | --- | --- |
 | LLM | `deepseek-chat` via [`langchain-deepseek`](https://pypi.org/project/langchain-deepseek/) (`ChatDeepSeek`, DeepSeek function calling) |
-| Agent | LangChain `create_agent` with two tools |
+| Agent | LangChain `create_agent` with three tools |
 | Vector store | Local [ChromaDB](https://www.trychroma.com/) (no cloud) |
 | Embeddings | Local Hugging Face model `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (DeepSeek has no public embedding API) |
 | PPT parsing | `python-pptx` (original Traditional Chinese text is **not** translated) |
@@ -19,7 +19,7 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 ## 4-level fallback (stop at the first hit)
 
 1. **Local RAG** — search the 4 PPTs in ChromaDB for working accidents on the same `MM-DD`.
-2. **Hong Kong workplace web search** — Tavily lookup for Hong Kong industrial / workplace accidents on this day in history.
+2. **Labour Department press releases** — search [labour.gov.hk news](https://www.labour.gov.hk/tc/major/content.php) for workplace accidents on this day.
 3. **World workplace web search** — Tavily lookup for working accidents worldwide on this day.
 4. **Historical fact** — if no working accident is found, search for an interesting fact on this day in previous years.
 
@@ -154,9 +154,10 @@ In the UI:
 | Tool | Role |
 | --- | --- |
 | `search_local_work_accidents` | Query ChromaDB. Matches `month_day` metadata (`MM-DD`) for any workplace accident in the 4 PPTs. Returns original PPT text or `[NO_HITS]`. |
-| `search_web` | Tavily Search. Used for levels 2–4 and for follow-up questions that need the public web. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
+| `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local RAG. |
+| `search_web` | Tavily Search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
 
-The DeepSeek model decides which tool to call. The daily-alert prompt forces this order: local RAG first, then Hong Kong workplace search, then world workplace search, then a historical fact.
+The DeepSeek model decides which tool to call. The daily-alert prompt forces this order: local RAG first, then the Labour Department site, then world workplace search, then a historical fact.
 
 ## Date handling
 
@@ -197,22 +198,19 @@ Expect:
 
 In Streamlit, set the sidebar date to a PPT accident date and open **工具呼叫紀錄**.
 
-### Level 2 — Hong Kong workplace web search
+### Level 2 — Labour Department press releases
 
-Pick an `MM-DD` that has **no** accident slide in the four PPTs:
+Pick an `MM-DD` that has **no** accident slide in the four PPTs, but may appear on [labour.gov.hk news](https://www.labour.gov.hk/tc/major/content.php) (for example a recent fatal workplace accident date):
 
 ```powershell
 python agent_mtr_bot.py --date YYYY-MM-DD --test-fallback
-python agent_mtr_bot.py --date YYYY-MM-DD
 ```
 
-`--test-fallback` runs the same two tools in strict order (no LLM tool choice) and prints which level fired.
-
-Expect level 1 to return `[NO_HITS]`, then a Tavily query about Hong Kong workplace / industrial accidents on that day in history.
+Expect level 1 to return `[NO_HITS]`, then `search_labour_department` to query the official listing first.
 
 ### Level 3 — world workplace web search
 
-If Tavily finds no Hong Kong working accident for that `MM-DD`, the next `search_web` query must be a **global** workplace / industrial accident search for the same day. Check the tool trace in the terminal or Streamlit expander.
+If the Labour Department listing also has no workplace accident for that `MM-DD`, the next `search_web` query must be a **global** workplace / industrial accident search for the same day. Check the tool trace in the terminal or Streamlit expander.
 
 ### Level 4 — historical fact
 

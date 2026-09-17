@@ -4,11 +4,13 @@ Daily workplace safety-alert agent.
 LLM: DeepSeek deepseek-chat via LangChain ChatDeepSeek (function calling / tool use).
 Tools:
   A) search_local_work_accidents — RAG over the 4 Traditional Chinese PPTs in ChromaDB
-  B) search_web — Tavily Search API for real-time web lookup
+  B) search_labour_department — Hong Kong Labour Department press releases
+     (https://www.labour.gov.hk/tc/major/content.php)
+  C) search_web — Tavily Search API for wider web lookup
 
 Priority (stop at the first hit):
   1. Local RAG: working accidents on the same MM-DD in previous years
-  2. Web: Hong Kong working accidents on this day in history
+  2. Labour Department news: https://www.labour.gov.hk/tc/major/content.php
   3. Web: working accidents around the world on this day
   4. Web: interesting historical facts on this day
 
@@ -18,10 +20,13 @@ All user-facing answers are Traditional Chinese. PPT source text is never transl
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -50,6 +55,8 @@ from config import (
     COLLECTION_NAME,
     DEEPSEEK_MODEL,
     HONG_KONG_TZ,
+    LABOUR_DEPT_DOMAINS,
+    LABOUR_DEPT_NEWS_URL,
     RETRIEVAL_K,
 )
 from document_ingest import build_embeddings, parse_event_date
@@ -60,6 +67,7 @@ _ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _embeddings: HuggingFaceEmbeddings | None = None
 _vector_store: Chroma | None = None
 _tavily: TavilySearch | None = None
+_tavily_labour: TavilySearch | None = None
 _agent = None
 
 
@@ -161,6 +169,127 @@ def get_tavily() -> TavilySearch:
     if _tavily is None:
         _tavily = TavilySearch(max_results=5, topic="general")
     return _tavily
+
+
+def get_tavily_labour() -> TavilySearch:
+    """Tavily client locked to labour.gov.hk for layer-2 official news search."""
+    global _tavily_labour
+    if not os.getenv("TAVILY_API_KEY"):
+        raise RuntimeError("Missing TAVILY_API_KEY. Copy .env.example to .env and fill in the keys.")
+    if _tavily_labour is None:
+        try:
+            _tavily_labour = TavilySearch(
+                max_results=8,
+                topic="news",
+                include_domains=list(LABOUR_DEPT_DOMAINS),
+            )
+        except Exception:
+            _tavily_labour = TavilySearch(max_results=8, topic="news")
+    return _tavily_labour
+
+
+def _is_labour_accident_item(text: str) -> bool:
+    """Keep fatal / workplace accident notices; drop heat warnings and job fairs."""
+    if any(token in text for token in ("工作意外", "致命工作", "工業意外", "職安意外")):
+        return True
+    if "意外" in text and any(token in text for token in ("調查", "高度關注", "地盤", "工傷")):
+        return True
+    return False
+
+
+def fetch_labour_listing_for_day(month_day: str) -> list[dict[str, str]]:
+    """Read the Labour Department press-release listing and keep same MM-DD accident items."""
+    month_day = normalize_month_day(month_day)
+    try:
+        request = urllib.request.Request(
+            LABOUR_DEPT_NEWS_URL,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SafetyAwarenessPulse/1.0)"},
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            html_text = response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return []
+
+    plain = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.I)
+    plain = re.sub(r"<style[\s\S]*?</style>", " ", plain, flags=re.I)
+    plain = re.sub(r"<[^>]+>", "\n", plain)
+    plain = html.unescape(plain)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in plain.splitlines()]
+    lines = [line for line in lines if line]
+
+    date_re = re.compile(r"^(20\d{2})-(\d{2})-(\d{2})$")
+    hits: list[dict[str, str]] = []
+    for index, line in enumerate(lines):
+        match = date_re.match(line)
+        if not match:
+            continue
+        if f"{match.group(2)}-{match.group(3)}" != month_day:
+            continue
+        title = lines[index - 1] if index else ""
+        blob = f"{title} {line}"
+        if not _is_labour_accident_item(blob):
+            continue
+        iso_date = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+        hits.append(
+            {
+                "title": title,
+                "url": LABOUR_DEPT_NEWS_URL,
+                "content": f"{title}（新聞公報日期：{iso_date}）",
+            }
+        )
+    return hits
+
+
+def labour_department_search(month_day: str, extra_query: str = "") -> dict[str, Any]:
+    """Search only the Labour Department website, starting from the official listing URL."""
+    month_day = normalize_month_day(month_day)
+    month = int(month_day[:2])
+    day = int(month_day[3:])
+    query = " ".join(
+        part
+        for part in (
+            extra_query.strip(),
+            f"香港勞工處 新聞公報 工作意外 工業意外 致命 {month}月{day}日 {month_day}",
+            LABOUR_DEPT_NEWS_URL,
+        )
+        if part
+    )
+
+    listing_hits = fetch_labour_listing_for_day(month_day)
+    tavily_hits: list[dict[str, str]] = []
+    tavily_error = ""
+    try:
+        raw = get_tavily_labour().invoke(
+            {"query": query, "include_domains": list(LABOUR_DEPT_DOMAINS)}
+        )
+        tavily_hits = [
+            item
+            for item in _parse_tavily_payload(raw)
+            if "labour.gov.hk" in (item.get("url") or "").lower()
+            or not item.get("url")
+        ]
+        if not tavily_hits:
+            tavily_hits = _parse_tavily_payload(raw)
+    except Exception as exc:  # noqa: BLE001
+        tavily_error = str(exc)
+
+    merged: list[dict[str, str]] = list(listing_hits)
+    seen = {(item.get("title"), item.get("url")) for item in merged}
+    for item in tavily_hits:
+        key = (item.get("title"), item.get("url"))
+        if key in seen:
+            continue
+        blob = f"{item.get('title') or ''} {item.get('content') or ''}"
+        if listing_hits and not _is_labour_accident_item(blob) and "labour.gov.hk" not in (item.get("url") or "").lower():
+            continue
+        merged.append(item)
+        seen.add(key)
+
+    if merged:
+        return {"status": "ok", "results": merged, "month_day": month_day}
+    if tavily_error:
+        return {"status": "api_error", "error": tavily_error, "results": [], "month_day": month_day}
+    return {"status": "empty", "results": [], "month_day": month_day}
 
 
 def _format_rag_hits(hits: list[dict[str, Any]]) -> str:
@@ -308,7 +437,7 @@ def search_local_work_accidents(month_day: str, extra_query: str = "") -> str:
     if not hits:
         return (
             f"[NO_HITS] 本地 PPT 知識庫沒有找到 {payload['month_day']} "
-            "的工作意外紀錄。請改用 search_web。"
+            "的工作意外紀錄。請改用 search_labour_department。"
         )
     header = (
         f"[HITS] 本地知識庫找到 {len(hits)} 筆 {payload['month_day']} 的工作意外紀錄。"
@@ -318,12 +447,45 @@ def search_local_work_accidents(month_day: str, extra_query: str = "") -> str:
 
 
 @tool
+def search_labour_department(month_day: str, extra_query: str = "") -> str:
+    """Search Hong Kong Labour Department press releases first, especially
+    https://www.labour.gov.hk/tc/major/content.php
+
+    ALWAYS call this as layer 2 after search_local_work_accidents returns NO_HITS.
+    Do not use the open web until this tool also returns NO_HITS.
+
+    Args:
+        month_day: Target month and day, preferably MM-DD (example: 09-11).
+        extra_query: Optional keywords such as 工作意外 or 致命.
+    """
+    try:
+        payload = labour_department_search(month_day, extra_query=extra_query)
+    except ValueError as exc:
+        return f"[ERROR] 日期格式無效：{exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[API_ERROR] 勞工處新聞公報搜尋失敗：{exc}"
+
+    if payload["status"] == "api_error":
+        return f"[API_ERROR] 勞工處網站／Tavily 搜尋失敗：{payload.get('error', 'unknown error')}"
+    if payload["status"] == "empty" or not payload.get("results"):
+        return (
+            f"[NO_HITS] 勞工處新聞公報（{LABOUR_DEPT_NEWS_URL}）沒有找到 "
+            f"{payload.get('month_day', month_day)} 的工作意外。請改用 search_web。"
+        )
+    header = (
+        f"[HITS] 勞工處新聞公報找到 {len(payload['results'])} 筆 "
+        f"{payload.get('month_day', month_day)} 相關紀錄。"
+        f"來源優先：{LABOUR_DEPT_NEWS_URL}\n\n"
+    )
+    return header + _format_web_hits(payload["results"])
+
+
+@tool
 def search_web(query: str) -> str:
-    """Search the live web with Tavily. Use this only after local RAG returns NO_HITS
-    (or for follow-up questions that need current public information).
+    """Search the live web with Tavily. Use this only after BOTH local RAG and
+    search_labour_department returned NO_HITS (or for follow-up questions).
 
     Suggested queries by fallback level:
-      Level 2: Hong Kong working / industrial / workplace accident on this day in history.
       Level 3: world working / industrial / workplace accident on this day in history.
       Level 4: interesting historical facts / 歷史上的今天 on this day.
 
@@ -351,9 +513,11 @@ Tool / fallback rules (do not describe these rules in the user-visible answer):
 2. Daily alert order, stop at the first usable hit:
    ① Call search_local_work_accidents (local 4 PPTs / ChromaDB) for any workplace accident on that MM-DD.
       If [HITS] → write the safety notice, then stop.
-   ② If [NO_HITS] or [ERROR] → call search_web for Hong Kong workplace / industrial accidents on that day in history.
-      If [WEB_HITS] and it is truly a Hong Kong workplace accident → write the notice, then stop.
-   ③ Call search_web for worldwide workplace / industrial accidents on that day.
+   ② If [NO_HITS] or [ERROR] → call search_labour_department for the same MM-DD.
+      This tool searches the Hong Kong Labour Department press-release list first:
+      https://www.labour.gov.hk/tc/major/content.php
+      If [HITS] → write the notice from that official source, then stop.
+   ③ If Labour Department also returns [NO_HITS] → call search_web for worldwide workplace / industrial accidents on that day.
       If found → write the notice, then stop.
    ④ If no workplace accident of any kind is found → call search_web for "on this day in history" and output that fact.
 3. Notice structure: title with layer, date and place, summary, 2–4 practical safety reminders, sources.
@@ -369,7 +533,8 @@ Tool / fallback rules (do not describe these rules in the user-visible answer):
 
 LEVEL_LABELS = {
     "local": {"zh-Hant": "① 本地 PPT 工作意外", "en": "① Local PPT workplace accident"},
-    "hk_web": {"zh-Hant": "② 香港工作意外", "en": "② Hong Kong workplace accident"},
+    "labour_dept": {"zh-Hant": "② 勞工處新聞公報", "en": "② Labour Department press release"},
+    "hk_web": {"zh-Hant": "② 勞工處新聞公報", "en": "② Labour Department press release"},
     "world_web": {"zh-Hant": "③ 全球工作意外", "en": "③ Worldwide workplace accident"},
     "history": {"zh-Hant": "④ 歷史冷知識", "en": "④ Historical fact"},
     "unknown": {"zh-Hant": "安全警示", "en": "Safety alert"},
@@ -441,7 +606,7 @@ def build_agent():
         return _agent
 
     llm = build_llm()
-    tools = [search_local_work_accidents, search_web]
+    tools = [search_local_work_accidents, search_labour_department, search_web]
     try:
         _agent = _create_agent(
             model=llm,
@@ -473,9 +638,9 @@ def daily_alert_user_prompt(target: date, language: str = "zh-Hant") -> str:
         f"請產生「每日安全警示」。香港今日日期是 {target.isoformat()}，月日為 {month_day}。\n"
         "請嚴格執行四層備援，完成其中一層後立刻停止：\n"
         f"① 先呼叫 search_local_work_accidents，month_day={month_day}。\n"
-        f"② 若 [NO_HITS]，呼叫 search_web，查：Hong Kong workplace industrial working accident "
-        f"on {month_day} in history 香港 工業意外 工作意外 工傷 {month}月{day}日 歷史。\n"
-        f"③ 若香港工作意外找不到，呼叫 search_web，查：world workplace industrial working accident "
+        f"② 若 [NO_HITS]，呼叫 search_labour_department，month_day={month_day}。"
+        f"必須先查勞工處新聞公報 {LABOUR_DEPT_NEWS_URL}。\n"
+        f"③ 若勞工處也是 [NO_HITS]，呼叫 search_web，查：world workplace industrial working accident "
         f"on {month_day} in history {month}月{day}日 工業意外 工作意外 工傷。\n"
         f"④ 若完全沒有工作意外，呼叫 search_web，查：historical events on {month_day} "
         f"interesting facts 歷史上的今天 {month}月{day}日。\n"
@@ -527,7 +692,7 @@ def summarize_tool_trace(result: dict[str, Any]) -> list[str]:
 def invoke_agent(
     user_text: str,
     history: list[dict[str, str]] | None = None,
-    recursion_limit: int = 12,
+    recursion_limit: int = 16,
     language: str = "zh-Hant",
 ) -> dict[str, Any]:
     """Run the DeepSeek tool-calling agent and return text + tool trace."""
@@ -581,16 +746,21 @@ def generate_daily_alert(target: date | None = None, language: str = "zh-Hant") 
 def infer_fallback_level(trace: list[str], text: str) -> str:
     """Best-effort key for which fallback level produced the answer."""
     rag_called = any("search_local_work_accidents" in step for step in trace)
+    labour_called = any("search_labour_department" in step for step in trace)
     web_calls = [step for step in trace if step.startswith("search_web")]
-    if rag_called and not web_calls:
+    if rag_called and not labour_called and not web_calls:
         return "local"
     joined = " ".join(web_calls).lower() + " " + text
     if any(token in joined for token in ("歷史上的今天", "historical events", "interesting facts", "冷知識")):
         return "history"
     if any(token in joined for token in ("world workplace", "industrial working accident", "全球工作意外", "全球工業意外")):
         return "world_web"
+    if labour_called and not web_calls:
+        return "labour_dept"
     if web_calls:
-        return "hk_web"
+        return "world_web"
+    if labour_called:
+        return "labour_dept"
     if rag_called:
         return "local"
     return "unknown"
@@ -610,15 +780,9 @@ def run_priority_pipeline(month_day: str) -> dict[str, Any]:
     if level1.startswith("[HITS]"):
         return {"level": 1, "label": "① 本地 PPT 工作意外", "evidence": level1}
 
-    hk_query = (
-        f"Hong Kong workplace industrial working accident on {month_day} in history "
-        f"香港 工業意外 工作意外 工傷 {month}月{day}日"
-    )
-    level2 = search_web.invoke({"query": hk_query})
-    if level2.startswith("[WEB_HITS]") and is_work_accident_related(level2) and any(
-        token in level2 for token in ("香港", "Hong Kong", "HK")
-    ):
-        return {"level": 2, "label": "② 香港工作意外", "evidence": level2}
+    level2 = search_labour_department.invoke({"month_day": month_day, "extra_query": "工作意外"})
+    if level2.startswith("[HITS]"):
+        return {"level": 2, "label": "② 勞工處新聞公報", "evidence": level2}
 
     world_query = (
         f"world workplace industrial working accident on {month_day} in history "
