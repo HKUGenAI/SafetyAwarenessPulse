@@ -19,5 +19,5 @@ chromadb>=0.5.23
 langchain-huggingface>=0.3.0
 sentence-transformers>=3.3.1
 
-# Web search tool
-langchain-tavily>=0.2.4
+# Web search: Serper Google Search API (stdlib urllib, no extra package)
+# See multi_search_api.SmartSearchTool

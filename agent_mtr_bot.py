@@ -40,6 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from langchain.tools import tool
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_deepseek import ChatDeepSeek
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_tavily import TavilySearch
@@ -108,7 +109,14 @@ def normalize_month_day(raw: str) -> str:
     if parsed_iso:
         return parsed_iso[5:]
 
-    loose = re.match(r"^(\d{1,2})[-/](\d{1,2})$", text)
+    chinese = re.fullmatch(
+        r"(0?[1-9]|1[0-2])\s*月\s*(0?[1-9]|[12]\d|3[01])\s*[日號]?",
+        text,
+    )
+    if chinese:
+        return f"{int(chinese.group(1)):02d}-{int(chinese.group(2)):02d}"
+
+    loose = re.match(r"^(\d{1,2})[-/.](\d{1,2})$", text)
     if loose:
         left, right = int(loose.group(1)), int(loose.group(2))
         # If the left number cannot be a month, treat as DD-MM.
@@ -120,17 +128,393 @@ def normalize_month_day(raw: str) -> str:
     raise ValueError(f"Cannot parse month-day from: {raw!r}. Expected MM-DD or YYYY-MM-DD.")
 
 
-def month_day_search_terms(month_day: str) -> list[str]:
-    """Date strings that may appear in PPT text or web articles."""
+_EN_MONTHS = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+_EN_MONTHS_SHORT = (
+    "",
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
+_EN_MONTH_LOOKUP = {}
+for _idx, _name in enumerate(_EN_MONTHS):
+    if _name:
+        _EN_MONTH_LOOKUP[_name.lower()] = _idx
+        _EN_MONTH_LOOKUP[_EN_MONTHS_SHORT[_idx].lower()] = _idx
+_EN_MONTH_LOOKUP["sept"] = 9
+
+# Two-digit alternatives first so 9月16日 is day=16, not day=1.
+# Never treat a bare day (16 / 17) as a date — that matches ages, headcounts, 2016.
+_ISO_DATE_IN_TEXT = re.compile(
+    r"(?:19|20)\d{2}[-/.](?P<month>1[0-2]|0?[1-9])[-/.](?P<day>[12]\d|3[01]|0?[1-9])"
+)
+_DMY_DATE_IN_TEXT = re.compile(
+    r"(?P<day>[12]\d|3[01]|0?[1-9])[-/.](?P<month>1[0-2]|0?[1-9])[-/.](?:19|20)\d{2}"
+)
+_MDY_DATE_IN_TEXT = re.compile(
+    r"(?P<month>1[0-2]|0?[1-9])[-/.](?P<day>[12]\d|3[01]|0?[1-9])[-/.](?:19|20)\d{2}"
+)
+_CHINESE_YMD_IN_TEXT = re.compile(
+    r"(?:(?:19|20)\d{2}\s*年\s*)?(?P<month>1[0-2]|0?[1-9])\s*月\s*"
+    r"(?P<day>[12]\d|3[01]|0?[1-9])\s*[日號]?(?!\d)"
+)
+_EN_MONTH_DAY_IN_TEXT = re.compile(
+    r"(?P<month>January|February|March|April|May|June|July|August|September|"
+    r"October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?\s+"
+    r"(?P<day>[12]\d|3[01]|0?[1-9])(?:st|nd|rd|th)?",
+    re.I,
+)
+_EN_DAY_MONTH_IN_TEXT = re.compile(
+    r"(?P<day>[12]\d|3[01]|0?[1-9])(?:st|nd|rd|th)?\s+(?:of\s+)?"
+    r"(?P<month>January|February|March|April|May|June|July|August|September|"
+    r"October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept|Sep|Oct|Nov|Dec)\.?",
+    re.I,
+)
+_YEARLESS_NUMERIC_DATE = re.compile(
+    r"(?<!\d)(?P<a>[12]\d|3[01]|0?[1-9])(?P<sep>[./-])(?P<b>[12]\d|3[01]|0?[1-9])(?!\d)"
+)
+
+
+def _day_ordinal(day: int) -> str:
+    if 10 < day < 14:
+        return f"{day}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def _unique_longest_first(items: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in sorted(items, key=len, reverse=True):
+        if item and item not in seen:
+            unique.append(item)
+            seen.add(item)
+    return unique
+
+
+def date_keyword_variants(month_day: str, *, with_years: bool = True) -> list[str]:
+    """Every common way the same MM-DD may be written. Never a bare day or month digit."""
+    month_day = normalize_month_day(month_day)
+    month = int(month_day[:2])
+    day = int(month_day[3:])
+    mm, dd = f"{month:02d}", f"{day:02d}"
+    m, d = str(month), str(day)
+    en = _EN_MONTHS[month]
+    en_short = _EN_MONTHS_SHORT[month]
+    ordinal = _day_ordinal(day)
+    variants = [
+        f"{mm}-{dd}",
+        f"{m}-{d}",
+        f"{mm}/{dd}",
+        f"{m}/{d}",
+        f"{mm}.{dd}",
+        f"{m}.{d}",
+        f"{dd}-{mm}",
+        f"{d}-{m}",
+        f"{dd}/{mm}",
+        f"{d}/{m}",
+        f"{dd}.{mm}",
+        f"{d}.{m}",
+        f"{m}月{d}日",
+        f"{mm}月{dd}日",
+        f"{m}月{d}號",
+        f"{mm}月{dd}號",
+        f"{m} 月 {d} 日",
+        f"{mm} 月 {dd} 日",
+        f"{m}月{d}",
+        f"{d}日{m}月",
+        f"{dd}日{mm}月",
+        f"{en} {day}",
+        f"{en} {dd}",
+        f"{en} {ordinal}",
+        f"{en_short} {day}",
+        f"{en_short} {dd}",
+        f"{en_short}. {day}",
+        f"{en_short}. {ordinal}",
+        f"{day} {en}",
+        f"{dd} {en}",
+        f"{ordinal} {en}",
+        f"{ordinal} of {en}",
+        f"{day} {en_short}",
+        f"{dd} {en_short}",
+        f"{ordinal} {en_short}",
+    ]
+    if with_years:
+        for year in range(2018, 2028):
+            variants.extend(
+                [
+                    f"{year}-{mm}-{dd}",
+                    f"{year}/{mm}/{dd}",
+                    f"{year}.{mm}.{dd}",
+                    f"{dd}-{mm}-{year}",
+                    f"{dd}/{mm}/{year}",
+                    f"{mm}-{dd}-{year}",
+                    f"{year}年{m}月{d}日",
+                    f"{year}年{mm}月{dd}日",
+                    f"{en} {day}, {year}",
+                    f"{ordinal} {en} {year}",
+                ]
+            )
+    return _unique_longest_first(variants)
+
+
+def compact_date_keywords(month_day: str) -> list[str]:
+    """Short, high-signal date spellings for Tavily / embedding queries."""
+    month_day = normalize_month_day(month_day)
     month = int(month_day[:2])
     day = int(month_day[3:])
     return [
-        month_day,
-        f"{month:02d}/{day:02d}",
-        f"{day:02d}-{month:02d}",
-        f"{day:02d}/{month:02d}",
         f"{month}月{day}日",
-        f"{month} 月 {day} 日",
+        month_day,
+        f"{month}.{day}",
+        f"{month}/{day}",
+        f"{day:02d}-{month:02d}",
+        f"{_EN_MONTHS[month]} {day}",
+        f"{day} {_EN_MONTHS[month]}",
+        f"{_EN_MONTHS_SHORT[month]} {day}",
+        f"{_day_ordinal(day)} {_EN_MONTHS[month]}",
+    ]
+
+
+def month_day_search_terms(month_day: str) -> list[str]:
+    """Backward-compatible alias used by existing call sites."""
+    return date_keyword_variants(month_day)
+
+
+def _pad_md(month: str | int, day: str | int) -> str:
+    return f"{int(month):02d}-{int(day):02d}"
+
+
+def _add_yearless_numeric_dates(text: str, found: set[str]) -> None:
+    """Match 9.16 / 09-16 / 16/09 only when not part of a larger number."""
+    for match in _YEARLESS_NUMERIC_DATE.finditer(text):
+        left, right = int(match.group("a")), int(match.group("b"))
+        if 1 <= left <= 12 and 1 <= right <= 31:
+            found.add(_pad_md(left, right))
+        if 1 <= right <= 12 and 1 <= left <= 31:
+            found.add(_pad_md(right, left))
+
+
+def extract_incident_month_days(text: str) -> set[str]:
+    """
+    Pull real calendar dates out of incident text.
+
+    Only structured dates count. A lone 17 (age, headcount, 2017) is ignored.
+    9.16 / 09-16 / 16-09-2023 / 9月16日 / September 16 are accepted.
+    9.17 does not satisfy a 09-16 query.
+    """
+    if not text:
+        return set()
+    found: set[str] = set()
+
+    for match in _ISO_DATE_IN_TEXT.finditer(text):
+        found.add(_pad_md(match.group("month"), match.group("day")))
+
+    for match in _DMY_DATE_IN_TEXT.finditer(text):
+        found.add(_pad_md(match.group("month"), match.group("day")))
+
+    for match in _MDY_DATE_IN_TEXT.finditer(text):
+        month, day = int(match.group("month")), int(match.group("day"))
+        if day > 12:
+            found.add(_pad_md(month, day))
+        elif month == day:
+            found.add(_pad_md(month, day))
+        else:
+            found.add(_pad_md(month, day))
+            found.add(_pad_md(day, month))
+
+    for match in _CHINESE_YMD_IN_TEXT.finditer(text):
+        found.add(_pad_md(match.group("month"), match.group("day")))
+
+    for match in _EN_MONTH_DAY_IN_TEXT.finditer(text):
+        month = _EN_MONTH_LOOKUP.get(match.group("month").lower().rstrip("."))
+        if month:
+            found.add(_pad_md(month, match.group("day")))
+
+    for match in _EN_DAY_MONTH_IN_TEXT.finditer(text):
+        month = _EN_MONTH_LOOKUP.get(match.group("month").lower().rstrip("."))
+        if month:
+            found.add(_pad_md(month, match.group("day")))
+
+    _add_yearless_numeric_dates(text, found)
+    return found
+
+
+def passes_same_date_guardrail(
+    text: str,
+    target_month_day: str,
+    metadata_month_day: str = "",
+) -> bool:
+    """
+    Keep an incident only if its event date is the requested MM-DD.
+
+    Metadata from PPT ingest wins when present. Otherwise the body must contain
+    an explicit date that maps to the same month-day. Nearby dates (09-17 when
+    asking 09-16) are rejected even if the text mentions 16 or 17 as a count.
+    """
+    try:
+        target = normalize_month_day(target_month_day)
+    except ValueError:
+        return False
+    meta = (metadata_month_day or "").strip()
+    if meta:
+        try:
+            if normalize_month_day(meta) == target:
+                return True
+        except ValueError:
+            pass
+        # Metadata says a different day — do not override with a loose substring.
+        try:
+            if normalize_month_day(meta) != target:
+                extracted = extract_incident_month_days(text)
+                return target in extracted
+        except ValueError:
+            pass
+
+    extracted = extract_incident_month_days(text)
+    return target in extracted
+
+
+def infer_month_day_from_query(query: str) -> str:
+    """Recover MM-DD from a search query so web hits can be date-guarded."""
+    text = (query or "").strip()
+    if not text:
+        return ""
+    token = re.search(r"(?<!\d)(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(?!\d)", text)
+    if token:
+        return f"{token.group(1)}-{token.group(2)}"
+    chinese = _CHINESE_YMD_IN_TEXT.search(text)
+    if chinese:
+        return _pad_md(chinese.group("month"), chinese.group("day"))
+    extracted = extract_incident_month_days(text)
+    if len(extracted) == 1:
+        return next(iter(extracted))
+    return ""
+
+
+def _doc_identity(doc: Document) -> tuple[Any, Any, str]:
+    return (
+        doc.metadata.get("source_file"),
+        doc.metadata.get("slide_number"),
+        (doc.page_content or "")[:80],
+    )
+
+
+def _documents_from_chroma_get(result: Any) -> list[Document]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, Document)]
+    if not isinstance(result, dict):
+        return []
+    documents = result.get("documents") or []
+    metadatas = result.get("metadatas") or []
+    docs: list[Document] = []
+    for content, meta in zip(documents, metadatas):
+        if content:
+            docs.append(Document(page_content=content, metadata=meta or {}))
+    return docs
+
+
+def _iter_all_local_documents(store: Chroma) -> list[Document]:
+    for getter in (
+        lambda: store.get(),
+        lambda: store._collection.get(include=["documents", "metadatas"]),
+    ):
+        try:
+            docs = _documents_from_chroma_get(getter())
+            if docs:
+                return docs
+        except Exception:
+            continue
+    return []
+
+
+def _text_has_date_keyword(text: str, month_day: str) -> bool:
+    """True if the body contains an explicit spelling of this MM-DD (never a bare day)."""
+    if not text:
+        return False
+    return any(term in text for term in date_keyword_variants(month_day))
+
+
+def keyword_search_local_accidents(store: Chroma, month_day: str) -> list[Document]:
+    """Keyword-first local recall: metadata MM-DD, then every date spelling in the body."""
+    month_day = normalize_month_day(month_day)
+    found: list[Document] = []
+    seen: set[tuple[Any, Any, str]] = set()
+
+    def absorb(docs: list[Document]) -> None:
+        for doc in docs:
+            key = _doc_identity(doc)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(doc)
+
+    for getter in (
+        lambda: store.get(where={"month_day": month_day}),
+        lambda: store._collection.get(
+            where={"month_day": month_day},
+            include=["documents", "metadatas"],
+        ),
+    ):
+        try:
+            absorb(_documents_from_chroma_get(getter()))
+            break
+        except Exception:
+            continue
+
+    for doc in _iter_all_local_documents(store):
+        content = doc.page_content or ""
+        meta_day = str(doc.metadata.get("month_day") or "")
+        if meta_day == month_day or _text_has_date_keyword(content, month_day):
+            absorb([doc])
+            continue
+        if month_day in extract_incident_month_days(content):
+            absorb([doc])
+    return found
+
+
+def _hits_passing_date_guardrail(docs: list[Document], month_day: str) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    for doc in docs:
+        content = doc.page_content or ""
+        meta_day = str(doc.metadata.get("month_day") or "")
+        if not passes_same_date_guardrail(content, month_day, meta_day):
+            continue
+        hits.append({"content": content, "metadata": doc.metadata})
+    return hits
+
+
+def _web_item_blob(item: dict[str, str]) -> str:
+    return f"{item.get('title') or ''} {item.get('content') or ''} {item.get('url') or ''}"
+
+
+def filter_same_date_web_hits(results: list[dict[str, str]], month_day: str) -> list[dict[str, str]]:
+    return [
+        item
+        for item in results
+        if passes_same_date_guardrail(_web_item_blob(item), month_day)
     ]
 
 
@@ -243,13 +627,12 @@ def fetch_labour_listing_for_day(month_day: str) -> list[dict[str, str]]:
 def labour_department_search(month_day: str, extra_query: str = "") -> dict[str, Any]:
     """Search only the Labour Department website, starting from the official listing URL."""
     month_day = normalize_month_day(month_day)
-    month = int(month_day[:2])
-    day = int(month_day[3:])
     query = " ".join(
         part
         for part in (
             extra_query.strip(),
-            f"香港勞工處 新聞公報 工作意外 工業意外 致命 {month}月{day}日 {month_day}",
+            "香港勞工處 新聞公報 工作意外 工業意外 致命",
+            " ".join(date_keyword_variants(month_day, with_years=False)),
             LABOUR_DEPT_NEWS_URL,
         )
         if part
@@ -279,8 +662,10 @@ def labour_department_search(month_day: str, extra_query: str = "") -> dict[str,
         key = (item.get("title"), item.get("url"))
         if key in seen:
             continue
-        blob = f"{item.get('title') or ''} {item.get('content') or ''}"
+        blob = _web_item_blob(item)
         if listing_hits and not _is_labour_accident_item(blob) and "labour.gov.hk" not in (item.get("url") or "").lower():
+            continue
+        if not passes_same_date_guardrail(blob, month_day):
             continue
         merged.append(item)
         seen.add(key)
@@ -310,48 +695,34 @@ def retrieve_local_work_accidents(month_day: str, extra_query: str = "") -> dict
     """
     Search ChromaDB for working accidents on the same MM-DD.
 
-    PPT text is returned in original Traditional Chinese (not translated).
-    Any workplace accident on that month-day is accepted (not limited to MTR).
+    Keyword search (all date spellings + metadata) runs first. Vector similarity
+    is only a fallback when keywords find no same-day hit. Unfiltered vector
+    search is not used — that path used to return 9.17 / "17 workers" for 9.16.
     """
     month_day = normalize_month_day(month_day)
     store = get_vector_store()
+
+    keyword_docs = keyword_search_local_accidents(store, month_day)
+    hits = _hits_passing_date_guardrail(keyword_docs, month_day)
+    if hits:
+        return {"month_day": month_day, "hits": hits, "retrieval": "keyword"}
+
     query_parts = [
         extra_query.strip(),
         "工業意外 工作意外 工傷 職業安全 地盤 工場 施工 意外 事故",
-        " ".join(month_day_search_terms(month_day)),
+        " ".join(date_keyword_variants(month_day, with_years=False)),
     ]
     query = " ".join(part for part in query_parts if part)
-
     try:
-        filtered = store.similarity_search(query, k=RETRIEVAL_K, filter={"month_day": month_day})
+        vector_docs = store.similarity_search(query, k=RETRIEVAL_K, filter={"month_day": month_day})
     except Exception:
-        # Older Chroma filter syntax / empty metadata should not abort the whole search.
-        filtered = []
-
-    try:
-        unfiltered = store.similarity_search(query, k=max(RETRIEVAL_K, 12))
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"ChromaDB retrieval failed: {exc}") from exc
-
-    merged = list(filtered)
-    seen = {(doc.metadata.get("source_file"), doc.metadata.get("slide_number"), doc.page_content[:80]) for doc in merged}
-    for doc in unfiltered:
-        key = (doc.metadata.get("source_file"), doc.metadata.get("slide_number"), doc.page_content[:80])
-        if key not in seen:
-            merged.append(doc)
-            seen.add(key)
-
-    hits: list[dict[str, Any]] = []
-    for doc in merged:
-        content = doc.page_content or ""
-        meta_day = str(doc.metadata.get("month_day") or "")
-        text_has_day = any(term in content for term in month_day_search_terms(month_day))
-        same_day = meta_day == month_day or text_has_day
-        if not same_day:
-            continue
-        hits.append({"content": content, "metadata": doc.metadata})
-
-    return {"month_day": month_day, "hits": hits}
+        vector_docs = []
+    hits = _hits_passing_date_guardrail(vector_docs, month_day)
+    return {
+        "month_day": month_day,
+        "hits": hits,
+        "retrieval": "vector_fallback" if hits else "none",
+    }
 
 
 def _parse_tavily_payload(raw: Any) -> list[dict[str, str]]:
@@ -415,6 +786,10 @@ def _format_web_hits(results: list[dict[str, str]]) -> str:
 def search_local_work_accidents(month_day: str, extra_query: str = "") -> str:
     """Search the local PPT knowledge base (ChromaDB) for working / industrial
     accidents that happened on the same month-day (MM-DD) in previous years.
+
+    Keyword search (all date spellings) is tried first. Vector search is only a
+    fallback. A same-day guardrail then keeps only incidents on that MM-DD.
+    Nearby dates such as 9.17, or a bare 17 (headcount / age), are rejected.
 
     ALWAYS call this tool first when generating the daily safety alert.
     Any workplace accident is accepted (construction, factory, railway, etc.).
@@ -481,19 +856,38 @@ def search_labour_department(month_day: str, extra_query: str = "") -> str:
 
 
 @tool
-def search_web(query: str) -> str:
+def search_web(query: str, month_day: str = "") -> str:
     """Search the live web with Tavily. Use this only after BOTH local RAG and
     search_labour_department returned NO_HITS (or for follow-up questions).
+
+    Write the target date in several forms in the query (9月16日, 09-16, 9.16,
+    16 September). Hits that are not that same MM-DD are dropped.
 
     Suggested queries by fallback level:
       Level 3: world working / industrial / workplace accident on this day in history.
       Level 4: interesting historical facts / 歷史上的今天 on this day.
 
     Args:
-        query: Search query. Include the month-day and the topic.
+        query: Search query. Include the month-day written in several forms.
+        month_day: Optional MM-DD guardrail. Inferred from query when omitted.
     """
+    inferred = ""
+    if (month_day or "").strip():
+        try:
+            inferred = normalize_month_day(month_day)
+        except ValueError:
+            inferred = infer_month_day_from_query(query)
+    else:
+        inferred = infer_month_day_from_query(query)
+
+    expanded = query
+    if inferred:
+        extra = " ".join(date_keyword_variants(inferred, with_years=False))
+        if extra not in query:
+            expanded = f"{query} {extra}".strip()
+
     try:
-        payload = web_search(query)
+        payload = web_search(expanded)
     except Exception as exc:  # noqa: BLE001
         return f"[API_ERROR] 網路搜尋連線失敗：{exc}"
 
@@ -502,8 +896,17 @@ def search_web(query: str) -> str:
     if payload["status"] == "api_error":
         return f"[API_ERROR] Tavily 搜尋失敗：{payload.get('error', 'unknown error')}"
     if payload["status"] == "empty":
-        return f"[EMPTY_SEARCH] 網路上沒有找到可用結果。查詢：{query}"
-    return "[WEB_HITS] 網路搜尋結果：\n\n" + _format_web_hits(payload["results"])
+        return f"[EMPTY_SEARCH] 網路上沒有找到可用結果。查詢：{expanded}"
+
+    results = payload["results"]
+    if inferred:
+        results = filter_same_date_web_hits(results, inferred)
+        if not results:
+            return (
+                f"[EMPTY_SEARCH] 搜尋結果均不是 {inferred} 當日的紀錄，已全部剔除。"
+                f"查詢：{expanded}"
+            )
+    return "[WEB_HITS] 網路搜尋結果：\n\n" + _format_web_hits(results)
 
 
 SYSTEM_PROMPT = """You are the Daily Safety Alert assistant for workplace safety staff.
@@ -520,12 +923,15 @@ Tool / fallback rules (do not describe these rules in the user-visible answer):
    ③ If Labour Department also returns [NO_HITS] → call search_web for worldwide workplace / industrial accidents on that day.
       If found → write the notice, then stop.
    ④ If no workplace accident of any kind is found → call search_web for "on this day in history" and output that fact.
-3. Notice structure: title with layer, date and place, summary, 2–4 practical safety reminders, sources.
-4. Never translate or rewrite the stored PPT text inside ChromaDB. When quoting a PPT, keep the original Traditional Chinese wording. In English output mode, quote the original then add an English paraphrase.
-5. Follow the OUTPUT_LANGUAGE tag in the latest user message:
+3. Date guardrail: only use an incident whose event date is the requested MM-DD.
+   Reject nearby dates (9.17 when asking 9.16) even if the text contains 16 or 17 as a count, age, or year fragment.
+   When calling search_web, pass month_day and write the date in several forms (9月16日, 09-16, 9.16, 16 September).
+4. Notice structure: title with layer, date and place, summary, 2–4 practical safety reminders, sources.
+5. Never translate or rewrite the stored PPT text inside ChromaDB. When quoting a PPT, keep the original Traditional Chinese wording. In English output mode, quote the original then add an English paraphrase.
+6. Follow the OUTPUT_LANGUAGE tag in the latest user message:
    - zh-Hant: every user-visible sentence must be Traditional Chinese (Hong Kong wording). No English sentences. No English process notes. Proper nouns such as ICU may stay as-is.
    - en: every user-visible sentence must be English, except original PPT quotes.
-6. The final answer must NEVER contain process / debug narration, including:
+7. The final answer must NEVER contain process / debug narration, including:
    "Level ①/②/③/④ returned...", "I'll output the historical fact", "Since no workplace accident was found",
    "依規則在此停止", tool names, [HITS], [NO_HITS], [WEB_HITS], [EMPTY_SEARCH].
    Those belong only in internal tool use, not in the text shown to the user.
@@ -640,10 +1046,13 @@ def daily_alert_user_prompt(target: date, language: str = "zh-Hant") -> str:
         f"① 先呼叫 search_local_work_accidents，month_day={month_day}。\n"
         f"② 若 [NO_HITS]，呼叫 search_labour_department，month_day={month_day}。"
         f"必須先查勞工處新聞公報 {LABOUR_DEPT_NEWS_URL}。\n"
-        f"③ 若勞工處也是 [NO_HITS]，呼叫 search_web，查：world workplace industrial working accident "
-        f"on {month_day} in history {month}月{day}日 工業意外 工作意外 工傷。\n"
-        f"④ 若完全沒有工作意外，呼叫 search_web，查：historical events on {month_day} "
-        f"interesting facts 歷史上的今天 {month}月{day}日。\n"
+        f"③ 若勞工處也是 [NO_HITS]，呼叫 search_web，month_day={month_day}，查："
+        f"world workplace industrial working accident on {month_day} in history "
+        f"{month}月{day}日 {month}.{day} {day} {_EN_MONTHS[month]} 工業意外 工作意外 工傷。"
+        f"只用 {month_day} 當日的意外。\n"
+        f"④ 若完全沒有工作意外，呼叫 search_web，month_day={month_day}，查："
+        f"historical events on {month_day} interesting facts 歷史上的今天 "
+        f"{month}月{day}日 {month}.{day}。\n"
         f"{closing}"
     )
 
@@ -773,8 +1182,6 @@ def run_priority_pipeline(month_day: str) -> dict[str, Any]:
     This does not rely on the LLM choosing tools; it calls the same two tools in order.
     """
     month_day = normalize_month_day(month_day)
-    month = int(month_day[:2])
-    day = int(month_day[3:])
 
     level1 = search_local_work_accidents.invoke({"month_day": month_day, "extra_query": "工業意外"})
     if level1.startswith("[HITS]"):
@@ -786,14 +1193,17 @@ def run_priority_pipeline(month_day: str) -> dict[str, Any]:
 
     world_query = (
         f"world workplace industrial working accident on {month_day} in history "
-        f"{month}月{day}日 工業意外 工作意外 工傷"
+        f"{' '.join(date_keyword_variants(month_day, with_years=False))} 工業意外 工作意外 工傷"
     )
-    level3 = search_web.invoke({"query": world_query})
+    level3 = search_web.invoke({"query": world_query, "month_day": month_day})
     if level3.startswith("[WEB_HITS]") and is_work_accident_related(level3):
         return {"level": 3, "label": "③ 全球工作意外", "evidence": level3}
 
-    fact_query = f"historical events on {month_day} interesting facts 歷史上的今天 {month}月{day}日"
-    level4 = search_web.invoke({"query": fact_query})
+    fact_query = (
+        f"historical events on {month_day} interesting facts 歷史上的今天 "
+        f"{' '.join(date_keyword_variants(month_day, with_years=False))}"
+    )
+    level4 = search_web.invoke({"query": fact_query, "month_day": month_day})
     return {"level": 4, "label": "④ 歷史冷知識", "evidence": level4}
 
 

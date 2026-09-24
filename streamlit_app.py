@@ -34,7 +34,7 @@ UI = {
         "settings": "設定",
         "language": "介面語言",
         "missing_deepseek": "尚未設定 DEEPSEEK_API_KEY。請複製 .env.example 為 .env。",
-        "missing_tavily": "尚未設定 TAVILY_API_KEY。請複製 .env.example 為 .env。",
+        "missing_serper": "尚未設定 SERPER_API_KEY。請複製 .env.example 為 .env。",
         "alert_date": "警示日期（香港）",
         "date_hint": "將使用月日 **{month_day}** 搜尋往年同日事件。",
         "generate": "重新產生警示",
@@ -64,7 +64,7 @@ UI = {
         "settings": "Settings",
         "language": "Interface language",
         "missing_deepseek": "DEEPSEEK_API_KEY is not set. Copy .env.example to .env.",
-        "missing_tavily": "TAVILY_API_KEY is not set. Copy .env.example to .env.",
+        "missing_serper": "SERPER_API_KEY is not set. Copy .env.example to .env.",
         "alert_date": "Alert date (Hong Kong)",
         "date_hint": "Will search previous years for the same month-day **{month_day}**.",
         "generate": "Regenerate alert",
@@ -188,8 +188,8 @@ with st.sidebar:
     st.header(t["settings"])
     if not os.getenv("DEEPSEEK_API_KEY"):
         st.error(t["missing_deepseek"])
-    if not os.getenv("TAVILY_API_KEY"):
-        st.error(t["missing_tavily"])
+    if not os.getenv("SERPER_API_KEY"):
+        st.error(t["missing_serper"])
     default_day = datetime.now(ZoneInfo(HONG_KONG_TZ)).date()
     selected_day = st.date_input(t["alert_date"], value=default_day, format="YYYY-MM-DD")
     st.caption(t["date_hint"].format(month_day=selected_day.strftime("%m-%d")))

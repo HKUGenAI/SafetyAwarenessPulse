@@ -13,14 +13,14 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 | Vector store | Local [ChromaDB](https://www.trychroma.com/) (no cloud) |
 | Embeddings | Local Hugging Face model `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (DeepSeek has no public embedding API) |
 | PPT parsing | `python-pptx` (original Traditional Chinese text is **not** translated) |
-| Web search | Tavily Search API (`langchain-tavily`) |
+| Web search | [Serper](https://serper.dev/) Google Search API (`multi_search_api.SmartSearchTool`) |
 | UI | Streamlit (Traditional Chinese copy) |
 
 ## 4-level fallback (stop at the first hit)
 
 1. **Local RAG** — search the 4 PPTs in ChromaDB for working accidents on the same `MM-DD`.
 2. **Labour Department press releases** — search [labour.gov.hk news](https://www.labour.gov.hk/tc/major/content.php) for workplace accidents on this day.
-3. **World workplace web search** — Tavily lookup for working accidents worldwide on this day.
+3. **World workplace web search** — Serper lookup for working accidents worldwide on this day.
 4. **Historical fact** — if no working accident is found, search for an interesting fact on this day in previous years.
 
 All **user-facing** answers are Traditional Chinese. Retrieved PPT wording is kept in the original Traditional Chinese; it is never translated before embedding or after retrieval.
@@ -33,7 +33,8 @@ SafetyAwarenessPulse/
 ├── chroma_db/                # Created by document_ingest.py (gitignored)
 ├── config.py
 ├── document_ingest.py        # Load → parse → chunk → embed → ChromaDB
-├── agent_mtr_bot.py          # DeepSeek agent + two tools + CLI chatbot
+├── multi_search_api.py       # Serper SmartSearchTool (cache + rate limits)
+├── agent_mtr_bot.py          # DeepSeek agent + three tools + CLI chatbot
 ├── streamlit_app.py          # Traditional Chinese web demo
 ├── requirements.txt
 ├── .env.example
@@ -51,7 +52,7 @@ The four source decks already in `assets/ppts`:
 
 - Python 3.10 or newer
 - A [DeepSeek API key](https://platform.deepseek.com/)
-- A [Tavily API key](https://tavily.com/)
+- A [Serper API key](https://serper.dev/)
 - Disk space for the first-time download of the local embedding model (~100 MB)
 
 ## Setup
@@ -93,7 +94,7 @@ Edit `.env`:
 
 ```
 DEEPSEEK_API_KEY=sk-...
-TAVILY_API_KEY=tvly-...
+SERPER_API_KEY=...
 ```
 
 ### 3. Confirm the PPT files are in place
@@ -155,7 +156,7 @@ In the UI:
 | --- | --- |
 | `search_local_work_accidents` | Query ChromaDB. Matches `month_day` metadata (`MM-DD`) for any workplace accident in the 4 PPTs. Returns original PPT text or `[NO_HITS]`. |
 | `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local RAG. |
-| `search_web` | Tavily Search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
+| `search_web` | Serper Search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
 
 The DeepSeek model decides which tool to call. The daily-alert prompt forces this order: local RAG first, then the Labour Department site, then world workplace search, then a historical fact.
 
@@ -172,8 +173,8 @@ The DeepSeek model decides which tool to call. The daily-alert prompt forces thi
 | --- | --- |
 | ChromaDB folder missing | RAG tool returns an error telling you to run `document_ingest.py` |
 | No accident hit on that `MM-DD` | `[NO_HITS]` → agent moves to the next fallback level |
-| Empty Tavily result | `[EMPTY_SEARCH]` → agent moves to the next fallback level |
-| DeepSeek / Tavily connection error | User-facing Traditional Chinese error; the app does not crash |
+| Empty Serper result | `[EMPTY_SEARCH]` → agent moves to the next fallback level |
+| DeepSeek / Serper connection error | User-facing Traditional Chinese error; the app does not crash |
 
 ## Testing guide (4-level fallback)
 
@@ -194,7 +195,7 @@ Expect:
 
 - Tool trace contains **only** `search_local_work_accidents`
 - The notice quotes original Traditional Chinese PPT wording
-- No Tavily call
+- No Serper call
 
 In Streamlit, set the sidebar date to a PPT accident date and open **工具呼叫紀錄**.
 
@@ -219,7 +220,7 @@ If levels 1–3 all miss, the last query is `historical events` / 歷史上的�
 ### Error-path checks
 
 1. Rename `chroma_db` and call the agent → ingest error, no crash.
-2. Put an invalid `TAVILY_API_KEY` in `.env` → `[API_ERROR]` from `search_web`.
+2. Put an invalid `SERPER_API_KEY` in `.env` → `[API_ERROR]` from `search_web`.
 3. After an alert is shown, ask：`這次意外的主要風險是甚麼？` → Traditional Chinese follow-up, tools optional.
 
 ## Notes
