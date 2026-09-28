@@ -9,15 +9,12 @@ langchain>=1.0.2
 langchain-core>=0.3.72
 langgraph>=0.4.0
 langchain-deepseek>=0.1.4
-langchain-text-splitters>=0.3.9
+langchain-tavily>=0.2.0
 
-# Local vector store (no cloud)
-langchain-chroma>=0.2.3
-chromadb>=0.5.23
-
-# Multilingual embeddings for Traditional Chinese (local, no extra API key)
-langchain-huggingface>=0.3.0
-sentence-transformers>=3.3.1
+# Discord channel daily broadcast
+discord.py>=2.4.0
+APScheduler>=3.10.4
 
 # Web search: Serper Google Search API (stdlib urllib, no extra package)
 # See multi_search_api.SmartSearchTool
+# Local events: stdlib sqlite3 (data/events.db)

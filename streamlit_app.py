@@ -2,7 +2,7 @@
 Simple Streamlit demo for the daily workplace safety-alert agent.
 
 Sidebar language switch: Traditional Chinese or English.
-ChromaDB / retrieval logic is unchanged.
+Local PPT lookup uses SQLite (data/events.db) by date.
 """
 
 from __future__ import annotations
@@ -144,6 +144,22 @@ def _init_state() -> None:
         st.session_state.ui_lang = "zh-Hant"
 
 
+def _date_from_query() -> date | None:
+    """Support Telegram deep links: /?date=YYYY-MM-DD."""
+    raw = st.query_params.get("date")
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else ""
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _history_for_agent(language: str) -> list[dict[str, str]]:
     bot = _agent_mod()
     history: list[dict[str, str]] = []
@@ -190,8 +206,11 @@ with st.sidebar:
         st.error(t["missing_deepseek"])
     if not os.getenv("SERPER_API_KEY"):
         st.error(t["missing_serper"])
-    default_day = datetime.now(ZoneInfo(HONG_KONG_TZ)).date()
+    query_day = _date_from_query()
+    default_day = query_day or datetime.now(ZoneInfo(HONG_KONG_TZ)).date()
     selected_day = st.date_input(t["alert_date"], value=default_day, format="YYYY-MM-DD")
+    if query_day != selected_day:
+        st.query_params["date"] = selected_day.isoformat()
     st.caption(t["date_hint"].format(month_day=selected_day.strftime("%m-%d")))
 
     alert_key = f"{selected_day.isoformat()}|{language}"

@@ -1,0 +1,19 @@
+[Unit]
+Description=Safety Awareness Pulse Streamlit UI
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/SafetyAwarenessPulse
+EnvironmentFile=/opt/SafetyAwarenessPulse/.env
+ExecStart=/opt/SafetyAwarenessPulse/.venv/bin/streamlit run streamlit_app.py \
+  --server.address 127.0.0.1 \
+  --server.port 8501 \
+  --server.headless true \
+  --browser.gatherUsageStats false
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

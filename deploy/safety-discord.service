@@ -1,0 +1,15 @@
+[Unit]
+Description=Safety Awareness Pulse Discord broadcaster
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/SafetyAwarenessPulse
+EnvironmentFile=/opt/SafetyAwarenessPulse/.env
+ExecStart=/opt/SafetyAwarenessPulse/.venv/bin/python discord_broadcast.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

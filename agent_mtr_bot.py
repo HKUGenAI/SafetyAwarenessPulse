@@ -3,13 +3,13 @@ Daily workplace safety-alert agent.
 
 LLM: DeepSeek deepseek-chat via LangChain ChatDeepSeek (function calling / tool use).
 Tools:
-  A) search_local_work_accidents — RAG over the 4 Traditional Chinese PPTs in ChromaDB
+  A) search_local_work_accidents — SQLite lookup by date over the 4 Traditional Chinese PPTs
   B) search_labour_department — Hong Kong Labour Department press releases
      (https://www.labour.gov.hk/tc/major/content.php)
   C) search_web — Tavily Search API for wider web lookup
 
 Priority (stop at the first hit):
-  1. Local RAG: working accidents on the same MM-DD in previous years
+  1. Local SQLite: working accidents on the same MM-DD in previous years
   2. Labour Department news: https://www.labour.gov.hk/tc/major/content.php
   3. Web: working accidents around the world on this day
   4. Web: interesting historical facts on this day
@@ -23,6 +23,7 @@ import argparse
 import html
 import json
 import os
+import random
 import re
 import sys
 import urllib.error
@@ -39,10 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from langchain.tools import tool
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
 from langchain_deepseek import ChatDeepSeek
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_tavily import TavilySearch
 
 try:
@@ -52,28 +50,25 @@ except ImportError:  # langchain < 1.0 fallback
 
 from config import (
     ACCIDENT_KEYWORDS,
-    CHROMA_DIR,
-    COLLECTION_NAME,
     DEEPSEEK_MODEL,
+    EVENTS_DB_PATH,
     HONG_KONG_TZ,
     LABOUR_DEPT_DOMAINS,
     LABOUR_DEPT_NEWS_URL,
-    RETRIEVAL_K,
 )
-from document_ingest import build_embeddings, parse_event_date
+from document_ingest import parse_event_date
+from events_db import db_ready, fetch_by_month_day
 
 _MONTH_DAY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
 _ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
-_embeddings: HuggingFaceEmbeddings | None = None
-_vector_store: Chroma | None = None
 _tavily: TavilySearch | None = None
 _tavily_labour: TavilySearch | None = None
 _agent = None
 
 
 class KnowledgeBaseError(RuntimeError):
-    """Raised when the local ChromaDB store is missing or unreadable."""
+    """Raised when the local SQLite events DB is missing or unreadable."""
 
 
 def today_in_hong_kong(override: str | None = None) -> date:
@@ -414,98 +409,6 @@ def infer_month_day_from_query(query: str) -> str:
     return ""
 
 
-def _doc_identity(doc: Document) -> tuple[Any, Any, str]:
-    return (
-        doc.metadata.get("source_file"),
-        doc.metadata.get("slide_number"),
-        (doc.page_content or "")[:80],
-    )
-
-
-def _documents_from_chroma_get(result: Any) -> list[Document]:
-    if isinstance(result, list):
-        return [item for item in result if isinstance(item, Document)]
-    if not isinstance(result, dict):
-        return []
-    documents = result.get("documents") or []
-    metadatas = result.get("metadatas") or []
-    docs: list[Document] = []
-    for content, meta in zip(documents, metadatas):
-        if content:
-            docs.append(Document(page_content=content, metadata=meta or {}))
-    return docs
-
-
-def _iter_all_local_documents(store: Chroma) -> list[Document]:
-    for getter in (
-        lambda: store.get(),
-        lambda: store._collection.get(include=["documents", "metadatas"]),
-    ):
-        try:
-            docs = _documents_from_chroma_get(getter())
-            if docs:
-                return docs
-        except Exception:
-            continue
-    return []
-
-
-def _text_has_date_keyword(text: str, month_day: str) -> bool:
-    """True if the body contains an explicit spelling of this MM-DD (never a bare day)."""
-    if not text:
-        return False
-    return any(term in text for term in date_keyword_variants(month_day))
-
-
-def keyword_search_local_accidents(store: Chroma, month_day: str) -> list[Document]:
-    """Keyword-first local recall: metadata MM-DD, then every date spelling in the body."""
-    month_day = normalize_month_day(month_day)
-    found: list[Document] = []
-    seen: set[tuple[Any, Any, str]] = set()
-
-    def absorb(docs: list[Document]) -> None:
-        for doc in docs:
-            key = _doc_identity(doc)
-            if key in seen:
-                continue
-            seen.add(key)
-            found.append(doc)
-
-    for getter in (
-        lambda: store.get(where={"month_day": month_day}),
-        lambda: store._collection.get(
-            where={"month_day": month_day},
-            include=["documents", "metadatas"],
-        ),
-    ):
-        try:
-            absorb(_documents_from_chroma_get(getter()))
-            break
-        except Exception:
-            continue
-
-    for doc in _iter_all_local_documents(store):
-        content = doc.page_content or ""
-        meta_day = str(doc.metadata.get("month_day") or "")
-        if meta_day == month_day or _text_has_date_keyword(content, month_day):
-            absorb([doc])
-            continue
-        if month_day in extract_incident_month_days(content):
-            absorb([doc])
-    return found
-
-
-def _hits_passing_date_guardrail(docs: list[Document], month_day: str) -> list[dict[str, Any]]:
-    hits: list[dict[str, Any]] = []
-    for doc in docs:
-        content = doc.page_content or ""
-        meta_day = str(doc.metadata.get("month_day") or "")
-        if not passes_same_date_guardrail(content, month_day, meta_day):
-            continue
-        hits.append({"content": content, "metadata": doc.metadata})
-    return hits
-
-
 def _web_item_blob(item: dict[str, str]) -> str:
     return f"{item.get('title') or ''} {item.get('content') or ''} {item.get('url') or ''}"
 
@@ -524,26 +427,13 @@ def is_work_accident_related(text: str) -> bool:
     return any(keyword.lower() in lower for keyword in ACCIDENT_KEYWORDS)
 
 
-def get_vector_store() -> Chroma:
-    """Load the local Chroma collection created by document_ingest.py."""
-    global _embeddings, _vector_store
-    if _vector_store is not None:
-        return _vector_store
-
-    if not CHROMA_DIR.exists() or not any(CHROMA_DIR.iterdir()):
+def ensure_events_db() -> None:
+    """Raise if the SQLite events DB has not been built yet."""
+    if not db_ready(EVENTS_DB_PATH):
         raise KnowledgeBaseError(
-            "本地向量資料庫尚未建立。請先執行：python document_ingest.py"
+            f"本地事件資料庫尚未建立（預期路徑：{EVENTS_DB_PATH}）。"
+            "請先執行：python document_ingest.py"
         )
-
-    if _embeddings is None:
-        _embeddings = build_embeddings()
-
-    _vector_store = Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=_embeddings,
-        persist_directory=str(CHROMA_DIR),
-    )
-    return _vector_store
 
 
 def get_tavily() -> TavilySearch:
@@ -680,48 +570,55 @@ def labour_department_search(month_day: str, extra_query: str = "") -> dict[str,
 def _format_rag_hits(hits: list[dict[str, Any]]) -> str:
     blocks: list[str] = []
     for index, hit in enumerate(hits, start=1):
-        meta = hit["metadata"]
+        meta = hit.get("metadata") or {}
         header = (
             f"[{index}] 來源檔案：{meta.get('source_file', '')} ｜ "
             f"投影片：{meta.get('slide_number', '')} ｜ "
             f"事故日期：{meta.get('iso_date') or '未知'} ｜ "
             f"月日：{meta.get('month_day') or '未知'}"
         )
-        blocks.append(header + "\n" + hit["content"])
+        blocks.append(header + "\n" + hit.get("content", ""))
     return "\n\n-----\n\n".join(blocks)
 
 
 def retrieve_local_work_accidents(month_day: str, extra_query: str = "") -> dict[str, Any]:
     """
-    Search ChromaDB for working accidents on the same MM-DD.
+    Look up SQLite events by month_day (MM-DD).
 
-    Keyword search (all date spellings + metadata) runs first. Vector similarity
-    is only a fallback when keywords find no same-day hit. Unfiltered vector
-    search is not used — that path used to return 9.17 / "17 workers" for 9.16.
+    Same calendar day may have multiple accident rows. For the daily alert,
+    exactly one event is chosen at random when several match.
     """
     month_day = normalize_month_day(month_day)
-    store = get_vector_store()
+    ensure_events_db()
+    candidates = fetch_by_month_day(month_day, extra_query=extra_query)
+    if not candidates:
+        return {
+            "month_day": month_day,
+            "hits": [],
+            "candidate_count": 0,
+            "retrieval": "none",
+        }
 
-    keyword_docs = keyword_search_local_accidents(store, month_day)
-    hits = _hits_passing_date_guardrail(keyword_docs, month_day)
-    if hits:
-        return {"month_day": month_day, "hits": hits, "retrieval": "keyword"}
-
-    query_parts = [
-        extra_query.strip(),
-        "工業意外 工作意外 工傷 職業安全 地盤 工場 施工 意外 事故",
-        " ".join(date_keyword_variants(month_day, with_years=False)),
-    ]
-    query = " ".join(part for part in query_parts if part)
-    try:
-        vector_docs = store.similarity_search(query, k=RETRIEVAL_K, filter={"month_day": month_day})
-    except Exception:
-        vector_docs = []
-    hits = _hits_passing_date_guardrail(vector_docs, month_day)
+    event = random.choice(candidates)
+    hit = {
+        "content": event["content"],
+        "metadata": {
+            "id": event.get("id"),
+            "iso_date": event["iso_date"],
+            "month_day": event["month_day"],
+            "title": event["title"],
+            "location": event["location"],
+            "category": event["category"],
+            "source_file": event["source_file"],
+            "slide_number": event["slide_number"],
+            "language": event["language"],
+        },
+    }
     return {
         "month_day": month_day,
-        "hits": hits,
-        "retrieval": "vector_fallback" if hits else "none",
+        "hits": [hit],
+        "candidate_count": len(candidates),
+        "retrieval": "sqlite_date_random",
     }
 
 
@@ -784,12 +681,12 @@ def _format_web_hits(results: list[dict[str, str]]) -> str:
 
 @tool
 def search_local_work_accidents(month_day: str, extra_query: str = "") -> str:
-    """Search the local PPT knowledge base (ChromaDB) for working / industrial
-    accidents that happened on the same month-day (MM-DD) in previous years.
+    """Search the local SQLite events DB (built from the 4 PPTs) for working /
+    industrial accidents on the same month-day (MM-DD) in previous years.
 
-    Keyword search (all date spellings) is tried first. Vector search is only a
-    fallback. A same-day guardrail then keeps only incidents on that MM-DD.
-    Nearby dates such as 9.17, or a bare 17 (headcount / age), are rejected.
+    Lookup is by date: WHERE month_day = MM-DD. Multiple accidents on the same
+    day are stored as separate rows; this tool returns exactly one of them
+    (random pick) for the daily alert.
 
     ALWAYS call this tool first when generating the daily safety alert.
     Any workplace accident is accepted (construction, factory, railway, etc.).
@@ -811,13 +708,20 @@ def search_local_work_accidents(month_day: str, extra_query: str = "") -> str:
     hits = payload["hits"]
     if not hits:
         return (
-            f"[NO_HITS] 本地 PPT 知識庫沒有找到 {payload['month_day']} "
+            f"[NO_HITS] 本地 PPT 事件庫沒有找到 {payload['month_day']} "
             "的工作意外紀錄。請改用 search_labour_department。"
         )
-    header = (
-        f"[HITS] 本地知識庫找到 {len(hits)} 筆 {payload['month_day']} 的工作意外紀錄。"
-        "以下為原文（繁體中文，未經翻譯）：\n\n"
-    )
+    candidate_count = int(payload.get("candidate_count") or len(hits))
+    if candidate_count > 1:
+        header = (
+            f"[HITS] 本地事件庫在 {payload['month_day']} 找到 {candidate_count} 筆工作意外，"
+            "今日警示隨機抽取其中 1 筆。以下為原文（繁體中文，未經翻譯）：\n\n"
+        )
+    else:
+        header = (
+            f"[HITS] 本地事件庫找到 1 筆 {payload['month_day']} 的工作意外紀錄。"
+            "以下為原文（繁體中文，未經翻譯）：\n\n"
+        )
     return header + _format_rag_hits(hits)
 
 
@@ -914,7 +818,7 @@ SYSTEM_PROMPT = """You are the Daily Safety Alert assistant for workplace safety
 Tool / fallback rules (do not describe these rules in the user-visible answer):
 1. Do not invent accidents. If a layer has no usable hit, go to the next layer.
 2. Daily alert order, stop at the first usable hit:
-   ① Call search_local_work_accidents (local 4 PPTs / ChromaDB) for any workplace accident on that MM-DD.
+   ① Call search_local_work_accidents (local SQLite events from the 4 PPTs) for any workplace accident on that MM-DD.
       If [HITS] → write the safety notice, then stop.
    ② If [NO_HITS] or [ERROR] → call search_labour_department for the same MM-DD.
       This tool searches the Hong Kong Labour Department press-release list first:
@@ -927,7 +831,7 @@ Tool / fallback rules (do not describe these rules in the user-visible answer):
    Reject nearby dates (9.17 when asking 9.16) even if the text contains 16 or 17 as a count, age, or year fragment.
    When calling search_web, pass month_day and write the date in several forms (9月16日, 09-16, 9.16, 16 September).
 4. Notice structure: title with layer, date and place, summary, 2–4 practical safety reminders, sources.
-5. Never translate or rewrite the stored PPT text inside ChromaDB. When quoting a PPT, keep the original Traditional Chinese wording. In English output mode, quote the original then add an English paraphrase.
+5. Never translate or rewrite the stored PPT text in SQLite. When quoting a PPT, keep the original Traditional Chinese wording. In English output mode, quote the original then add an English paraphrase.
 6. Follow the OUTPUT_LANGUAGE tag in the latest user message:
    - zh-Hant: every user-visible sentence must be Traditional Chinese (Hong Kong wording). No English sentences. No English process notes. Proper nouns such as ICU may stay as-is.
    - en: every user-visible sentence must be English, except original PPT quotes.
@@ -1152,6 +1056,123 @@ def generate_daily_alert(target: date | None = None, language: str = "zh-Hant") 
     return outcome
 
 
+def _count_zh_chars(text: str) -> int:
+    """Count characters for the Telegram short-reminder length check (ignore whitespace)."""
+    return len(re.sub(r"\s+", "", text or ""))
+
+
+def _clip_reminder(text: str, *, min_chars: int = 30, max_chars: int = 50) -> str:
+    """Keep Traditional Chinese reminder roughly within 30–50 characters."""
+    cleaned = re.sub(r"\s+", "", (text or "").strip())
+    cleaned = cleaned.strip("「」『』\"'。！？!?；;，,、")
+    if not cleaned:
+        return "今日請留意職安風險，工作前先檢查防護。"
+    if _count_zh_chars(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars]
+    if _count_zh_chars(cleaned) < min_chars:
+        pad = "請提高警覺，遵守安全守則。"
+        if cleaned and cleaned[-1] not in "。！？!?":
+            cleaned = cleaned + "。"
+        cleaned = (cleaned + pad)[:max_chars]
+    return cleaned
+
+
+def _fallback_short_from_evidence(evidence: str) -> str:
+    """Heuristic short line when the LLM is unavailable."""
+    lines = [line.strip() for line in (evidence or "").splitlines() if line.strip()]
+    body = ""
+    for line in lines:
+        if line.startswith("[") or line.startswith("來源") or line.startswith("網址"):
+            continue
+        if "-----" in line:
+            continue
+        body = line
+        break
+    if not body and lines:
+        body = lines[-1]
+    # Prefer a practical reminder framing.
+    if "意外" in body or "事故" in body:
+        return _clip_reminder(f"往年今日曾發生工業意外，請提高警覺並做好防護。")
+    return _clip_reminder(body or "今日請留意職安風險，工作前先檢查防護。")
+
+
+def generate_short_reminder(
+    target: date | None = None,
+) -> dict[str, Any]:
+    """
+    Build a Discord-ready safety reminder: Traditional Chinese, ~30–50 characters.
+
+    Uses the deterministic 4-level pipeline for evidence, then DeepSeek to compress.
+    Returns detail_text (full event evidence) for the in-Discord "了解更多" button.
+    """
+    target = target or today_in_hong_kong()
+    month_day = to_month_day(target)
+    iso_date = target.isoformat()
+
+    pipeline = run_priority_pipeline(month_day)
+    evidence = str(pipeline.get("evidence") or "")[:3500]
+    level_label = str(pipeline.get("label") or "")
+    detail_text = _format_detail_for_discord(
+        iso_date=iso_date,
+        month_day=month_day,
+        level_label=level_label,
+        evidence=evidence,
+    )
+
+    prompt = (
+        "你是職場安全短訊編輯。根據下列資料，寫一句繁體中文（香港用詞）每日安全提醒。\n"
+        "硬性要求：\n"
+        "1. 只輸出提醒正文本身，不要標題、不要引號、不要來源、不要連結。\n"
+        "2. 長度必須約 30 至 50 個字（含標點），寧可精簡。\n"
+        "3. 內容要可執行（提醒防護／檢查／程序），不要長篇敘述案情。\n"
+        f"日期：{iso_date}（月日 {month_day}）\n"
+        f"資料層級：{level_label}\n"
+        f"資料：\n{evidence}\n"
+    )
+
+    text = ""
+    error = None
+    try:
+        llm = build_llm()
+        response = llm.invoke(prompt)
+        text = getattr(response, "content", None) or str(response)
+        if isinstance(text, list):
+            text = "".join(str(part) for part in text)
+        text = _clip_reminder(str(text).strip())
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
+        text = _fallback_short_from_evidence(evidence)
+
+    return {
+        "text": text,
+        "iso_date": iso_date,
+        "month_day": month_day,
+        "detail_text": detail_text,
+        "level_label": level_label,
+        "char_count": _count_zh_chars(text),
+        "error": error,
+    }
+
+
+def _format_detail_for_discord(
+    *,
+    iso_date: str,
+    month_day: str,
+    level_label: str,
+    evidence: str,
+) -> str:
+    """Format the full event evidence shown when the user clicks 了解更多."""
+    body = (evidence or "").strip() or "（暫無詳細資料）"
+    header = (
+        f"【事件詳情】\n"
+        f"日期：{iso_date}（月日 {month_day}）\n"
+        f"來源層級：{level_label or '未知'}\n"
+        f"{'─' * 16}\n"
+    )
+    # Discord message limit is 2000; leave room for header when splitting later.
+    return header + body
+
+
 def infer_fallback_level(trace: list[str], text: str) -> str:
     """Best-effort key for which fallback level produced the answer."""
     rag_called = any("search_local_work_accidents" in step for step in trace)
@@ -1268,7 +1289,7 @@ def main() -> None:
         "--lang",
         choices=["zh-Hant", "en"],
         default="zh-Hant",
-        help="User-facing output language. Does not change ChromaDB or retrieval.",
+        help="User-facing output language. Does not change SQLite retrieval.",
     )
     parser.add_argument(
         "--test-fallback",
@@ -1306,7 +1327,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Prerequisites:
 #   1) Copy .env.example to .env and set DEEPSEEK_API_KEY + TAVILY_API_KEY
-#   2) python document_ingest.py          # build local ChromaDB from ./assets/ppts
+#   2) python document_ingest.py          # build data/events.db from ./assets/ppts
 #   3) python agent_mtr_bot.py --chat     # or: streamlit run streamlit_app.py
 #
 # The PPTs are industrial-accident newspaper cuttings (not limited to MTR).
@@ -1315,7 +1336,7 @@ if __name__ == "__main__":
 #   - 04-04-2023  港鐵灣仔站維修工於路軌跌倒
 #   - 01-03-2023  港鐵旺角站扶手梯維修
 #
-# Level ① Local RAG (must stop here, do not call Tavily):
+# Level ① Local SQLite date lookup (must stop here, do not call Tavily):
 #   python agent_mtr_bot.py --date 2026-12-29
 #   python agent_mtr_bot.py --date 2026-04-04
 #   Expected: tool trace contains only search_local_work_accidents
@@ -1338,7 +1359,7 @@ if __name__ == "__main__":
 #   a fact rather than a workplace safety notice.
 #
 # Empty / error handling checks:
-#   - Delete or rename chroma_db/ then call RAG → [ERROR] asking you to ingest first.
+#   - Delete or rename data/events.db then call local search → [ERROR] asking you to ingest first.
 #   - Temporarily set a bad TAVILY_API_KEY → [API_ERROR] without crashing the app.
 #   - Agent follow-up: after an alert is shown, ask「這次意外的主要風險是甚麼？」
 #     The chatbot should answer in Traditional Chinese, optionally calling tools again.

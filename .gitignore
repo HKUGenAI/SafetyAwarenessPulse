@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.py[cod]
 chroma_db/
+data/
 hf_cache/
 .streamlit/secrets.toml
 .pytest_cache/

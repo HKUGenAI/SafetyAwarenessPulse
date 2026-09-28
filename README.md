@@ -2,7 +2,7 @@
 
 A LangChain agent that posts a **daily workplace safety alert** in Traditional Chinese.
 
-It first looks up working accidents that happened on the same month-day (`MM-DD`) in a local RAG knowledge base built from four Traditional Chinese PowerPoint newspaper-cutting decks. If nothing is found, it searches the [Hong Kong Labour Department press-release list](https://www.labour.gov.hk/tc/major/content.php), then falls back to worldwide workplace accidents, then historical facts.
+It first looks up working accidents that happened on the same month-day (`MM-DD`) in a local SQLite events database built from four Traditional Chinese PowerPoint newspaper-cutting decks. If nothing is found, it searches the [Hong Kong Labour Department press-release list](https://www.labour.gov.hk/tc/major/content.php), then falls back to worldwide workplace accidents, then historical facts.
 
 ## Architecture
 
@@ -10,32 +10,36 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 | --- | --- |
 | LLM | `deepseek-chat` via [`langchain-deepseek`](https://pypi.org/project/langchain-deepseek/) (`ChatDeepSeek`, DeepSeek function calling) |
 | Agent | LangChain `create_agent` with three tools |
-| Vector store | Local [ChromaDB](https://www.trychroma.com/) (no cloud) |
-| Embeddings | Local Hugging Face model `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (DeepSeek has no public embedding API) |
+| Event store | Local **SQLite** (`data/events.db`); one row per accident; lookup by `month_day` |
+
 | PPT parsing | `python-pptx` (original Traditional Chinese text is **not** translated) |
-| Web search | [Serper](https://serper.dev/) Google Search API (`multi_search_api.SmartSearchTool`) |
-| UI | Streamlit (Traditional Chinese copy) |
+| Web search | [Serper](https://serper.dev/) Google Search API (`multi_search_api.SmartSearchTool`) / Tavily for some agent paths |
+| UI | Optional Streamlit local demo |
+| Discord | Channel broadcast via `discord_broadcast.py` (09:00 HK short reminder + in-app details) |
 
 ## 4-level fallback (stop at the first hit)
 
-1. **Local RAG** — search the 4 PPTs in ChromaDB for working accidents on the same `MM-DD`.
+1. **Local SQLite** — `WHERE month_day = MM-DD` against events ingested from the 4 PPTs.
 2. **Labour Department press releases** — search [labour.gov.hk news](https://www.labour.gov.hk/tc/major/content.php) for workplace accidents on this day.
-3. **World workplace web search** — Serper lookup for working accidents worldwide on this day.
+3. **World workplace web search** — lookup for working accidents worldwide on this day.
 4. **Historical fact** — if no working accident is found, search for an interesting fact on this day in previous years.
 
-All **user-facing** answers are Traditional Chinese. Retrieved PPT wording is kept in the original Traditional Chinese; it is never translated before embedding or after retrieval.
+All **user-facing** answers are Traditional Chinese. Retrieved PPT wording is kept in the original Traditional Chinese; it is never translated.
 
 ## Project layout
 
 ```
 SafetyAwarenessPulse/
 ├── assets/ppts/              # Place the 4 Traditional Chinese PPT files here
-├── chroma_db/                # Created by document_ingest.py (gitignored)
+├── data/events.db            # Created by document_ingest.py (gitignored)
+├── deploy/                   # systemd examples for VPS
 ├── config.py
-├── document_ingest.py        # Load → parse → chunk → embed → ChromaDB
+├── events_db.py              # SQLite schema + date lookups
+├── document_ingest.py        # Load PPT slides → structured events → SQLite
 ├── multi_search_api.py       # Serper SmartSearchTool (cache + rate limits)
 ├── agent_mtr_bot.py          # DeepSeek agent + three tools + CLI chatbot
-├── streamlit_app.py          # Traditional Chinese web demo
+├── discord_broadcast.py      # Daily 09:00 HK Discord short reminder + 了解更多
+├── streamlit_app.py          # Optional local Traditional Chinese web demo
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -52,8 +56,7 @@ The four source decks already in `assets/ppts`:
 
 - Python 3.10 or newer
 - A [DeepSeek API key](https://platform.deepseek.com/)
-- A [Serper API key](https://serper.dev/)
-- Disk space for the first-time download of the local embedding model (~100 MB)
+- A [Serper API key](https://serper.dev/) (and/or Tavily, depending on which web path you use)
 
 ## Setup
 
@@ -97,6 +100,13 @@ DEEPSEEK_API_KEY=sk-...
 SERPER_API_KEY=...
 ```
 
+For Discord channel broadcast, also set:
+
+```
+DISCORD_BOT_TOKEN=...
+DISCORD_CHANNEL_ID=123456789012345678
+```
+
 ### 3. Confirm the PPT files are in place
 
 Put (or keep) the four Traditional Chinese PPT files in:
@@ -105,9 +115,9 @@ Put (or keep) the four Traditional Chinese PPT files in:
 ./assets/ppts
 ```
 
-### 4. Ingest documents into local ChromaDB (run this first)
+### 4. Ingest documents into SQLite (run this first)
 
-This reads every slide with `python-pptx`, keeps the original Traditional Chinese text, splits long slides, embeds them locally, and writes `./chroma_db`.
+This reads every slide with `python-pptx`, keeps the original Traditional Chinese text, parses the event date, and writes **one row per accident** into `./data/events.db`. Same calendar day can have multiple rows.
 
 ```powershell
 python document_ingest.py
@@ -119,7 +129,7 @@ Rebuild from scratch:
 python document_ingest.py --reset
 ```
 
-The first run downloads the embedding model. Ingesting four large decks on CPU can take several minutes.
+Slides without a parseable date are skipped (they cannot be keyed by date).
 
 ### 5. Run the chatbot
 
@@ -137,10 +147,16 @@ python agent_mtr_bot.py --date 2026-04-04
 python agent_mtr_bot.py --chat
 ```
 
-Streamlit UI (Traditional Chinese):
+Streamlit UI (optional local demo):
 
 ```powershell
 streamlit run streamlit_app.py
+```
+
+Deep link (local only):
+
+```
+http://localhost:8501/?date=2026-04-04
 ```
 
 In the UI:
@@ -150,31 +166,102 @@ In the UI:
 3. Click **點擊此警示，繼續追問**.
 4. Type follow-up questions in **想了解更多？在此提問**.
 
+## Discord channel broadcast
+
+Every day at **09:00 Asia/Hong_Kong**, a short Traditional Chinese reminder (~30–50 characters) is posted to your Discord channel, with an **了解更多** button. Clicking the button shows the **full event details inside Discord** (ephemeral reply) — not an external website.
+
+### 1. Create the Discord bot
+
+1. Open [Discord Developer Portal](https://discord.com/developers/applications) → **New Application** → **Bot** → copy `DISCORD_BOT_TOKEN`.
+2. OAuth2 → URL Generator → scopes: `bot` → permissions: **Send Messages**, **Read Message History**, **Embed Links** (optional).
+3. Invite the bot into your server with that URL.
+4. Enable **Developer Mode** in Discord (Settings → Advanced) → right-click the target channel → **Copy Channel ID** → `DISCORD_CHANNEL_ID`.
+
+### 2. Local test send
+
+```powershell
+pip install -r requirements.txt
+# fill DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in .env
+python discord_broadcast.py --once
+python discord_broadcast.py --once --date 2026-04-04
+```
+
+`--once` posts immediately, then **keeps the bot online** so **了解更多** still works. Stop with Ctrl+C.
+
+### 3. Run the daily scheduler
+
+```powershell
+python discord_broadcast.py
+```
+
+Optional overrides in `.env`: `DISCORD_BROADCAST_HOUR`, `DISCORD_BROADCAST_MINUTE`.
+
+Event details for each posted day are cached under `data/discord_detail_cache.json` so button clicks survive bot restarts.
+
+## Deploy on a VPS (Discord bot)
+
+Assumes Ubuntu and project at `/opt/SafetyAwarenessPulse`. No public website is required for Discord details.
+
+### 1. Install and ingest
+
+```bash
+sudo mkdir -p /opt/SafetyAwarenessPulse
+sudo chown $USER:$USER /opt/SafetyAwarenessPulse
+# copy or git clone the project into /opt/SafetyAwarenessPulse
+cd /opt/SafetyAwarenessPulse
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # edit DEEPSEEK_*, SERPER_*, DISCORD_*
+python document_ingest.py --reset
+```
+
+### 2. systemd service
+
+Edit `User=` / paths in the unit file if needed, then:
+
+```bash
+sudo cp deploy/safety-discord.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now safety-discord
+sudo systemctl status safety-discord
+```
+
+Test from the server:
+
+```bash
+cd /opt/SafetyAwarenessPulse && .venv/bin/python discord_broadcast.py --once
+```
+
+(Optional) If you still want a public Streamlit UI, also install Nginx using `deploy/nginx-safety-awareness.conf` and `deploy/safety-streamlit.service`. Discord **了解更多** does not depend on it.
+
 ## Tools
 
 | Tool | Role |
 | --- | --- |
-| `search_local_work_accidents` | Query ChromaDB. Matches `month_day` metadata (`MM-DD`) for any workplace accident in the 4 PPTs. Returns original PPT text or `[NO_HITS]`. |
-| `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local RAG. |
-| `search_web` | Serper Search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
+| `search_local_work_accidents` | Query SQLite by `month_day` (`MM-DD`). If several accidents match, **one is chosen at random**. Returns original PPT text or `[NO_HITS]`. |
+| `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local DB. |
+| `search_web` | Web search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
 
-The DeepSeek model decides which tool to call. The daily-alert prompt forces this order: local RAG first, then the Labour Department site, then world workplace search, then a historical fact.
+The DeepSeek model decides which tool to call. The daily-alert prompt forces this order: local SQLite first, then the Labour Department site, then world workplace search, then a historical fact.
 
 ## Date handling
 
 - “Today” is computed in `Asia/Hong_Kong`.
 - PPT cuttings in this dataset use **DD-MM-YYYY** (example: `04-04-2023`).
-- Matching is by **month-day only** (`MM-DD`), so 2023-04-04 can trigger an alert on 2026-04-04.
+- Each stored accident is **one SQLite row** (`id` primary key). `iso_date` / `month_day` are indexed lookup fields (not unique).
+- Daily alerts match by **month-day only** (`MM-DD` index), so 2023-04-04 can trigger an alert on 2026-04-04.
+- If several accidents share the same `MM-DD`, the daily alert **randomly picks one**.
 - The CLI / UI also accept `YYYY-MM-DD` and `MM-DD`.
 
 ## Error handling
 
 | Situation | Behaviour |
 | --- | --- |
-| ChromaDB folder missing | RAG tool returns an error telling you to run `document_ingest.py` |
+| `data/events.db` missing | Local tool returns an error telling you to run `document_ingest.py` |
 | No accident hit on that `MM-DD` | `[NO_HITS]` → agent moves to the next fallback level |
-| Empty Serper result | `[EMPTY_SEARCH]` → agent moves to the next fallback level |
-| DeepSeek / Serper connection error | User-facing Traditional Chinese error; the app does not crash |
+| Empty web result | `[EMPTY_SEARCH]` → agent moves to the next fallback level |
+| DeepSeek / web API connection error | User-facing Traditional Chinese error; the app does not crash |
 
 ## Testing guide (4-level fallback)
 
@@ -184,7 +271,7 @@ The PPTs are industrial-accident newspaper cuttings (construction, factory, rail
 - `04-04-2023` — 港鐵灣仔站維修工於路軌跌倒
 - `01-03-2023` — 港鐵旺角站扶手梯維修
 
-### Level 1 — local PPT / RAG
+### Level 1 — local PPT / SQLite
 
 ```powershell
 python agent_mtr_bot.py --date 2026-12-29
@@ -195,7 +282,7 @@ Expect:
 
 - Tool trace contains **only** `search_local_work_accidents`
 - The notice quotes original Traditional Chinese PPT wording
-- No Serper call
+- No web call
 
 In Streamlit, set the sidebar date to a PPT accident date and open **工具呼叫紀錄**.
 
@@ -219,12 +306,12 @@ If levels 1–3 all miss, the last query is `historical events` / 歷史上的�
 
 ### Error-path checks
 
-1. Rename `chroma_db` and call the agent → ingest error, no crash.
+1. Rename `data/events.db` and call the agent → ingest error, no crash.
 2. Put an invalid `SERPER_API_KEY` in `.env` → `[API_ERROR]` from `search_web`.
 3. After an alert is shown, ask：`這次意外的主要風險是甚麼？` → Traditional Chinese follow-up, tools optional.
 
 ## Notes
 
 - PPT content is industrial-accident newspaper cuttings. Level 1 accepts **any** working accident on that `MM-DD`, not only railway cases.
-- Embeddings and Chroma live entirely on disk under `chroma_db/`. Nothing is sent to a vector-DB cloud.
+- The events DB lives entirely on disk under `data/events.db`. No vector-DB cloud is used.
 - `deepseek-reasoner` is **not** used: DeepSeek documents function calling on `deepseek-chat`.

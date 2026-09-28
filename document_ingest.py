@@ -1,7 +1,8 @@
 """
-Ingest Traditional Chinese PPT newspaper cuttings into a local ChromaDB store.
+Ingest Traditional Chinese PPT newspaper cuttings into a local SQLite events DB.
 
-Do not translate PPT content. Original wording is preserved in chunks and embeddings.
+Each dated slide becomes one event row keyed by iso_date (YYYY-MM-DD).
+Original wording is preserved; nothing is translated.
 
 Usage:
     python document_ingest.py
@@ -25,21 +26,11 @@ load_dotenv()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-from config import (
-    CHROMA_DIR,
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
-    COLLECTION_NAME,
-    EMBEDDING_MODEL_NAME,
-    PPT_DIR,
-)
+from config import EVENTS_DB_PATH, PPT_DIR
+from events_db import connect, init_db, insert_event, reset_db
 
 # PPT files in this project use DD-MM-YYYY (e.g. 29-12-2023).
 _DATE_DD_MM_YYYY = re.compile(
@@ -56,15 +47,6 @@ _FIELD_PATTERNS = {
     "location": re.compile(r"地點\s*[:：]\s*([^\n]+)"),
     "category": re.compile(r"分類\s*[:：]\s*([^\n]+)"),
 }
-
-
-def build_embeddings() -> HuggingFaceEmbeddings:
-    """Create a local multilingual embedding model (no cloud API)."""
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
 
 
 def iter_shapes(shapes: Any) -> Any:
@@ -114,7 +96,6 @@ def extract_slide_text(slide: Any) -> str:
         if notes:
             lines.append(notes)
 
-    # Collapse extra blank lines but keep paragraph boundaries.
     cleaned = "\n".join(line.strip() for line in lines if line.strip())
     return cleaned.strip()
 
@@ -188,8 +169,13 @@ def parse_slide_fields(text: str) -> dict[str, str]:
     return fields
 
 
-def load_ppt_documents(ppt_dir: Path) -> list[Document]:
-    """Load every .pptx/.ppt file and turn each slide into a LangChain Document."""
+def load_ppt_events(ppt_dir: Path) -> tuple[list[dict[str, Any]], int]:
+    """
+    Load every .pptx/.ppt file and turn each dated slide into an event dict.
+
+    Slides without a parseable date are skipped (iso_date is the primary key).
+    Returns (events, skipped_undated_count).
+    """
     ppt_files = sorted(ppt_dir.glob("*.pptx")) + sorted(ppt_dir.glob("*.ppt"))
     ppt_files = [path for path in ppt_files if not path.name.startswith("~$")]
     if not ppt_files:
@@ -197,7 +183,8 @@ def load_ppt_documents(ppt_dir: Path) -> list[Document]:
             f"No PPT files found in {ppt_dir}. Place the 4 Traditional Chinese PPTs there first."
         )
 
-    documents: list[Document] = []
+    events: list[dict[str, Any]] = []
+    skipped_undated = 0
     for ppt_path in ppt_files:
         print(f"[ingest] Opening {ppt_path.name} ...")
         try:
@@ -214,82 +201,69 @@ def load_ppt_documents(ppt_dir: Path) -> list[Document]:
                 continue
 
             fields = parse_slide_fields(text)
-            metadata = {
-                "source_file": ppt_path.name,
-                "source_path": str(ppt_path),
-                "slide_number": index,
-                "title": fields["title"],
-                "iso_date": fields["iso_date"],
-                "month_day": fields["month_day"],
-                "location": fields["location"][:200],
-                "category": fields["category"][:200],
-                "language": "zh-Hant",
-            }
-            documents.append(Document(page_content=text, metadata=metadata))
+            if not fields["iso_date"]:
+                skipped_undated += 1
+                continue
+
+            events.append(
+                {
+                    "iso_date": fields["iso_date"],
+                    "month_day": fields["month_day"],
+                    "title": fields["title"],
+                    "location": fields["location"][:200],
+                    "category": fields["category"][:200],
+                    "content": text,
+                    "source_file": ppt_path.name,
+                    "slide_number": index,
+                    "language": "zh-Hant",
+                }
+            )
             kept += 1
 
-        print(f"[ingest] {ppt_path.name}: {kept} non-empty slides / {len(presentation.slides)} total")
+        print(f"[ingest] {ppt_path.name}: {kept} dated slides / {len(presentation.slides)} total")
 
-    print(f"[ingest] Total non-empty slides: {len(documents)}")
-    return documents
+    print(f"[ingest] Total dated events: {len(events)}")
+    print(f"[ingest] Skipped undated (non-empty) slides: {skipped_undated}")
+    return events, skipped_undated
 
 
-def split_documents(documents: list[Document]) -> list[Document]:
-    """
-    Split long slides, but keep a typical accident record as one chunk.
+def persist_to_sqlite(events: list[dict[str, Any]], reset: bool = False) -> None:
+    """Write structured events into SQLite. One row per accident (same day kept separate)."""
+    if not events:
+        raise ValueError("No dated events to store. Check PPT date parsing output.")
 
-    Separators include Chinese punctuation so Traditional Chinese is not broken mid-word.
-    """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", "。", "；", "，", " ", ""],
+    if reset:
+        reset_db(EVENTS_DB_PATH)
+        print(f"[ingest] Reset: deleted {EVENTS_DB_PATH}")
+
+    inserted = 0
+    replaced = 0
+    with connect(EVENTS_DB_PATH) as conn:
+        init_db(conn)
+        for event in events:
+            result = insert_event(conn, event)
+            if result == "inserted":
+                inserted += 1
+            elif result == "replaced":
+                replaced += 1
+        conn.commit()
+        total = conn.execute("SELECT COUNT(*) AS n FROM events").fetchone()["n"]
+        same_day = conn.execute(
+            """
+            SELECT COUNT(*) AS n FROM (
+                SELECT iso_date FROM events GROUP BY iso_date HAVING COUNT(*) > 1
+            )
+            """
+        ).fetchone()["n"]
+
+    print(f"[ingest] Done. Saved to {EVENTS_DB_PATH}")
+    print(
+        f"[ingest] Rows inserted: {inserted}, replaced (same slide): {replaced}, "
+        f"total rows: {total}, dates with multiple accidents: {same_day}"
     )
-
-    chunks: list[Document] = []
-    for doc in documents:
-        if len(doc.page_content) <= CHUNK_SIZE:
-            chunks.append(doc)
-            continue
-        for part in splitter.split_text(doc.page_content):
-            chunks.append(Document(page_content=part, metadata=dict(doc.metadata)))
-    return chunks
-
-
-def persist_to_chroma(chunks: list[Document], reset: bool = False) -> None:
-    """Embed original Traditional Chinese chunks and save them to local ChromaDB."""
-    if not chunks:
-        raise ValueError("No text chunks to embed. Check PPT parsing output.")
-
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    embeddings = build_embeddings()
-
-    if reset and CHROMA_DIR.exists():
-        vector_store = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=embeddings,
-            persist_directory=str(CHROMA_DIR),
-        )
-        try:
-            vector_store.delete_collection()
-            print("[ingest] Existing Chroma collection deleted.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[ingest] WARNING: could not delete old collection: {exc}")
-
-    print(f"[ingest] Embedding {len(chunks)} chunks with {EMBEDDING_MODEL_NAME} ...")
-    Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        collection_name=COLLECTION_NAME,
-        persist_directory=str(CHROMA_DIR),
-    )
-    dated = sum(1 for chunk in chunks if chunk.metadata.get("month_day"))
-    print(f"[ingest] Done. Saved to {CHROMA_DIR}")
-    print(f"[ingest] Chunks with parsed MM-DD metadata: {dated}/{len(chunks)}")
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest PPT files into local ChromaDB.")
+    parser = argparse.ArgumentParser(description="Ingest PPT files into local SQLite events DB.")
     parser.add_argument(
         "--ppt-dir",
         type=Path,
@@ -299,15 +273,14 @@ def main() -> None:
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Delete the existing Chroma collection before ingesting.",
+        help="Delete the existing SQLite database before ingesting.",
     )
     args = parser.parse_args()
 
     print(f"[ingest] PPT folder: {args.ppt_dir}")
-    documents = load_ppt_documents(args.ppt_dir)
-    chunks = split_documents(documents)
-    print(f"[ingest] Chunks after split: {len(chunks)}")
-    persist_to_chroma(chunks, reset=args.reset)
+    print(f"[ingest] SQLite DB: {EVENTS_DB_PATH}")
+    events, _skipped = load_ppt_events(args.ppt_dir)
+    persist_to_sqlite(events, reset=args.reset)
 
 
 if __name__ == "__main__":
