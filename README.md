@@ -201,42 +201,159 @@ Optional overrides in `.env`: `DISCORD_BROADCAST_HOUR`, `DISCORD_BROADCAST_MINUT
 
 Event details for each posted day are cached under `data/discord_detail_cache.json` so button clicks survive bot restarts.
 
-## Deploy on a VPS (Discord bot)
+## Deploy on a Linux server (Discord bot + tmux)
 
-Assumes Ubuntu and project at `/opt/SafetyAwarenessPulse`. No public website is required for Discord details.
+No public website is required. The bot only needs outbound HTTPS (Azure OpenAI, Serper, Discord) and a long-running process.
 
-### 1. Install and ingest
+### 1. Upload the project from Windows
+
+Connect to HKU lab hosts via Jump Host (example):
+
+```powershell
+ssh -L 9998:10.21.36.11:9998 -J h3629140@gatekeeper.cs.hku.hk qiyue@10.21.36.11
+```
+
+Upload from your PC (replace user/host; **do not upload Windows `.venv`**):
+
+```powershell
+ssh -J h3629140@gatekeeper.cs.hku.hk qiyue@10.21.36.11 "mkdir -p ~/SafetyAwarenessPulse"
+
+cd D:\RA\SafetyAwarenessPulse
+scp -J h3629140@gatekeeper.cs.hku.hk -r `
+  agent_mtr_bot.py config.py discord_broadcast.py document_ingest.py events_db.py `
+  multi_search_api.py streamlit_app.py requirements.txt .env.example README.md `
+  assets data deploy `
+  qiyue@10.21.36.11:~/SafetyAwarenessPulse/
+```
+
+Also upload `.env` (or create it on the server in the next step):
+
+```powershell
+scp -J h3629140@gatekeeper.cs.hku.hk D:\RA\SafetyAwarenessPulse\.env qiyue@10.21.36.11:~/SafetyAwarenessPulse/.env
+```
+
+Copy either `data/events.db` **or** `assets/ppts/` so the server can load / rebuild the SQLite store.
+
+Gatekeeper may require **HKU network or HKUVPN**.
+
+### 2. Create `.env` on the server
+
+Option A — upload (above).  
+Option B — edit on the server:
 
 ```bash
-sudo mkdir -p /opt/SafetyAwarenessPulse
-sudo chown $USER:$USER /opt/SafetyAwarenessPulse
-# copy or git clone the project into /opt/SafetyAwarenessPulse
-cd /opt/SafetyAwarenessPulse
+cd ~/SafetyAwarenessPulse
+cp -n .env.example .env
+nano .env
+chmod 600 .env
+```
+
+Required keys:
+
+```
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=https://mtr-project.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2024-12-01-preview
+AZURE_OPENAI_DEPLOYMENT=gpt-5.4-mini
+SERPER_API_KEY=...
+DISCORD_BOT_TOKEN=...
+DISCORD_CHANNEL_ID=...
+DISCORD_BROADCAST_HOUR=9
+DISCORD_BROADCAST_MINUTE=30
+```
+
+### 3. Python environment (with or without sudo)
+
+**If you have sudo** (normal Ubuntu/VPS):
+
+```bash
+sudo apt update
+sudo apt install -y tmux python3-venv python3-pip
+cd ~/SafetyAwarenessPulse
+rm -rf .venv
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -U pip
 pip install -r requirements.txt
-cp .env.example .env   # edit AZURE_OPENAI_*, SERPER_*, DISCORD_*
+```
+
+**If you do NOT have sudo** (common on shared lab machines — `apt` / `python3 -m venv` fails):
+
+```bash
+cd ~/SafetyAwarenessPulse
+rm -rf .venv
+
+curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+python3 /tmp/get-pip.py --user
+export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+python3 -m pip install --user virtualenv
+python3 -m virtualenv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+```
+
+If `data/events.db` is missing and PPTs are present:
+
+```bash
 python document_ingest.py --reset
 ```
 
-### 2. systemd service
-
-Edit `User=` / paths in the unit file if needed, then:
+Smoke-test once (bot stays online for the **了解更多** button):
 
 ```bash
+python discord_broadcast.py --once
+# Ctrl+C when done testing
+```
+
+### 4. Run under tmux (recommended)
+
+```bash
+cd ~/SafetyAwarenessPulse
+tmux new -s safety-bot
+```
+
+Inside the green tmux bar session:
+
+```bash
+source .venv/bin/activate
+python discord_broadcast.py
+```
+
+You should see login / `Scheduler started...` lines.
+
+| Action | How |
+| --- | --- |
+| Detach (keep bot running) | `Ctrl+B`, then `D` |
+| Re-attach after SSH | `tmux attach -t safety-bot` |
+| List sessions | `tmux ls` |
+| Stop bot | `tmux kill-session -t safety-bot` |
+
+Optional helper script (needs a working `.venv` first):
+
+```bash
+chmod +x deploy/tmux_start.sh
+./deploy/tmux_start.sh
+tmux attach -t safety-bot
+```
+
+Stop any local Windows `python discord_broadcast.py` so you do not double-post.
+
+### 5. Optional: systemd (machines with sudo)
+
+For a VPS where you control root, see `deploy/safety-discord.service`:
+
+```bash
+# edit WorkingDirectory / User in the unit file first
 sudo cp deploy/safety-discord.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now safety-discord
 sudo systemctl status safety-discord
 ```
 
-Test from the server:
-
-```bash
-cd /opt/SafetyAwarenessPulse && .venv/bin/python discord_broadcast.py --once
-```
-
-(Optional) If you still want a public Streamlit UI, also install Nginx using `deploy/nginx-safety-awareness.conf` and `deploy/safety-streamlit.service`. Discord **了解更多** does not depend on it.
+(Optional Streamlit UI: `deploy/nginx-safety-awareness.conf` + `deploy/safety-streamlit.service`. Discord details do not need it.)
 
 ## Tools
 
