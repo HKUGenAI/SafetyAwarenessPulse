@@ -4,11 +4,12 @@ streamlit>=1.40.0
 pydantic>=2.9.0
 tzdata>=2024.1
 
-# LangChain agent + DeepSeek function calling
+# LangChain agent + Azure OpenAI function calling
 langchain>=1.0.2
 langchain-core>=0.3.72
 langgraph>=0.4.0
-langchain-deepseek>=0.1.4
+langchain-openai>=0.3.0
+openai>=1.40.0
 
 # Discord channel daily broadcast
 discord.py>=2.4.0

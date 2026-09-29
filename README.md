@@ -8,7 +8,7 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 
 | Layer | Choice |
 | --- | --- |
-| LLM | `deepseek-chat` via [`langchain-deepseek`](https://pypi.org/project/langchain-deepseek/) (`ChatDeepSeek`, DeepSeek function calling) |
+| LLM | Azure OpenAI `gpt-5.4-mini` via [`langchain-openai`](https://pypi.org/project/langchain-openai/) (`AzureChatOpenAI`) |
 | Agent | LangChain `create_agent` with three tools |
 | Event store | Local **SQLite** (`data/events.db`); one row per accident; lookup by `month_day` |
 
@@ -37,7 +37,7 @@ SafetyAwarenessPulse/
 ├── events_db.py              # SQLite schema + date lookups
 ├── document_ingest.py        # Load PPT slides → structured events → SQLite
 ├── multi_search_api.py       # Serper SmartSearchTool (cache + rate limits)
-├── agent_mtr_bot.py          # DeepSeek agent + three tools + CLI chatbot
+├── agent_mtr_bot.py          # Azure OpenAI agent + three tools + CLI chatbot
 ├── discord_broadcast.py      # Daily 09:00 HK Discord short reminder + 了解更多
 ├── streamlit_app.py          # Optional local Traditional Chinese web demo
 ├── requirements.txt
@@ -55,7 +55,7 @@ The four source decks already in `assets/ppts`:
 ## Prerequisites
 
 - Python 3.10 or newer
-- A [DeepSeek API key](https://platform.deepseek.com/)
+- An [Azure OpenAI](https://oai.azure.com/) API key with a `gpt-5.4-mini` deployment
 - A [Serper API key](https://serper.dev/)
 
 ## Setup
@@ -96,7 +96,10 @@ copy .env.example .env
 Edit `.env`:
 
 ```
-DEEPSEEK_API_KEY=sk-...
+AZURE_OPENAI_API_KEY=<your-api-key>
+AZURE_OPENAI_ENDPOINT=https://mtr-project.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2024-12-01-preview
+AZURE_OPENAI_DEPLOYMENT=gpt-5.4-mini
 SERPER_API_KEY=...
 ```
 
@@ -212,7 +215,7 @@ cd /opt/SafetyAwarenessPulse
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # edit DEEPSEEK_*, SERPER_*, DISCORD_*
+cp .env.example .env   # edit AZURE_OPENAI_*, SERPER_*, DISCORD_*
 python document_ingest.py --reset
 ```
 
@@ -243,7 +246,7 @@ cd /opt/SafetyAwarenessPulse && .venv/bin/python discord_broadcast.py --once
 | `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local DB. |
 | `search_web` | Web search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
 
-The DeepSeek model decides which tool to call. The daily-alert prompt forces this order: local SQLite first, then the Labour Department site, then world workplace search, then a historical fact.
+The Azure OpenAI model decides which tool to call. The daily-alert prompt forces this order: local SQLite first, then the Labour Department site, then world workplace search, then a historical fact.
 
 ## Date handling
 
@@ -326,7 +329,7 @@ print(fetch_by_iso_date("2023-04-04"))
 | `data/events.db` missing | Local tool returns an error telling you to run `document_ingest.py` |
 | No accident hit on that `MM-DD` | `[NO_HITS]` → agent moves to the next fallback level |
 | Empty web result | `[EMPTY_SEARCH]` → agent moves to the next fallback level |
-| DeepSeek / web API connection error | User-facing Traditional Chinese error; the app does not crash |
+| Azure OpenAI / web API connection error | User-facing Traditional Chinese error; the app does not crash |
 
 ## Testing guide (4-level fallback)
 
@@ -379,4 +382,4 @@ If levels 1–3 all miss, the last query is `historical events` / 歷史上的�
 
 - PPT content is industrial-accident newspaper cuttings. Level 1 accepts **any** working accident on that `MM-DD`, not only railway cases.
 - The events DB lives entirely on disk under `data/events.db`. No vector-DB cloud is used.
-- `deepseek-reasoner` is **not** used: DeepSeek documents function calling on `deepseek-chat`.
+- LLM calls go to Azure OpenAI deployment `gpt-5.4-mini` (`AZURE_OPENAI_DEPLOYMENT`).

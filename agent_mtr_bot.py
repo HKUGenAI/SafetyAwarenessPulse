@@ -1,7 +1,7 @@
 """
 Daily workplace safety-alert agent.
 
-LLM: DeepSeek deepseek-chat via LangChain ChatDeepSeek (function calling / tool use).
+LLM: Azure OpenAI gpt-5.4-mini via LangChain AzureChatOpenAI (function calling / tool use).
 Tools:
   A) search_local_work_accidents — SQLite lookup by date over the 4 Traditional Chinese PPTs
   B) search_labour_department — Hong Kong Labour Department press releases
@@ -40,7 +40,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from langchain.tools import tool
-from langchain_deepseek import ChatDeepSeek
+from langchain_openai import AzureChatOpenAI
 
 try:
     from langchain.agents import create_agent as _create_agent
@@ -49,7 +49,9 @@ except ImportError:  # langchain < 1.0 fallback
 
 from config import (
     ACCIDENT_KEYWORDS,
-    DEEPSEEK_MODEL,
+    AZURE_OPENAI_API_VERSION,
+    AZURE_OPENAI_DEPLOYMENT,
+    AZURE_OPENAI_ENDPOINT,
     EVENTS_DB_PATH,
     HONG_KONG_TZ,
     LABOUR_DEPT_DOMAINS,
@@ -852,22 +854,30 @@ def sanitize_user_facing_text(text: str) -> str:
     return cleaned or text.strip()
 
 
-def build_llm() -> ChatDeepSeek:
-    """DeepSeek chat model with native function calling."""
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing DEEPSEEK_API_KEY. Copy .env.example to .env and fill in the keys.")
-    return ChatDeepSeek(
-        model=DEEPSEEK_MODEL,
-        temperature=0.2,
+def build_llm() -> AzureChatOpenAI:
+    """Azure OpenAI chat model (gpt-5.4-mini) with tool / function calling."""
+    api_key = (os.getenv("AZURE_OPENAI_API_KEY") or "").strip()
+    if not api_key or api_key.startswith("<") or api_key == "your-api-key":
+        raise RuntimeError(
+            "Missing AZURE_OPENAI_API_KEY. Copy .env.example to .env and fill in the key."
+        )
+    endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or AZURE_OPENAI_ENDPOINT).rstrip("/") + "/"
+    deployment = (os.getenv("AZURE_OPENAI_DEPLOYMENT") or AZURE_OPENAI_DEPLOYMENT).strip()
+    api_version = (os.getenv("AZURE_OPENAI_API_VERSION") or AZURE_OPENAI_API_VERSION).strip()
+    return AzureChatOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version=api_version,
+        azure_deployment=deployment,
         max_retries=2,
         timeout=120,
-        api_key=api_key,
+        # GPT-5 family uses max_completion_tokens; temperature is left at API default.
+        model_kwargs={"max_completion_tokens": 16384},
     )
 
 
 def build_agent():
-    """LangChain tool-calling agent powered by DeepSeek function calling."""
+    """LangChain tool-calling agent powered by Azure OpenAI function calling."""
     global _agent
     if _agent is not None:
         return _agent
@@ -965,7 +975,7 @@ def invoke_agent(
     recursion_limit: int = 16,
     language: str = "zh-Hant",
 ) -> dict[str, Any]:
-    """Run the DeepSeek tool-calling agent and return text + tool trace."""
+    """Run the Azure OpenAI tool-calling agent and return text + tool trace."""
     language = normalize_output_language(language)
     agent = build_agent()
     messages: list[dict[str, str]] = []
@@ -1059,7 +1069,7 @@ def generate_short_reminder(
     """
     Build a Discord-ready safety reminder: Traditional Chinese, ~30–50 characters.
 
-    Uses the deterministic 4-level pipeline for evidence, then DeepSeek to compress.
+    Uses the deterministic 4-level pipeline for evidence, then Azure OpenAI to compress.
     Returns detail_text (full event evidence) for the in-Discord "了解更多" button.
     """
     target = target or today_in_hong_kong()
@@ -1239,7 +1249,7 @@ def interactive_chat(start_date: date, language: str = "zh-Hant") -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Workplace safety-alert agent (DeepSeek + SQLite + Serper).")
+    parser = argparse.ArgumentParser(description="Workplace safety-alert agent (Azure OpenAI + SQLite + Serper).")
     parser.add_argument("--date", help="Override Hong Kong date, YYYY-MM-DD or MM-DD.")
     parser.add_argument("--chat", action="store_true", help="Start an interactive terminal chatbot.")
     parser.add_argument(
@@ -1283,7 +1293,7 @@ if __name__ == "__main__":
 # Testing guide: verifying the 4-level fallback logic
 # ---------------------------------------------------------------------------
 # Prerequisites:
-#   1) Copy .env.example to .env and set DEEPSEEK_API_KEY + SERPER_API_KEY
+#   1) Copy .env.example to .env and set AZURE_OPENAI_API_KEY + SERPER_API_KEY
 #   2) python document_ingest.py          # build data/events.db from ./assets/ppts
 #   3) python agent_mtr_bot.py --chat     # or: streamlit run streamlit_app.py
 #

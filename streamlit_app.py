@@ -33,7 +33,7 @@ UI = {
         "caption": "以史為鑑　·　本地 PPT 知識庫優先　·　工作意外安全提示",
         "settings": "設定",
         "language": "介面語言",
-        "missing_deepseek": "尚未設定 DEEPSEEK_API_KEY。請複製 .env.example 為 .env。",
+        "missing_azure": "尚未設定 AZURE_OPENAI_API_KEY。請複製 .env.example 為 .env。",
         "missing_serper": "尚未設定 SERPER_API_KEY。請複製 .env.example 為 .env。",
         "alert_date": "警示日期（香港）",
         "date_hint": "將使用月日 **{month_day}** 搜尋往年同日事件。",
@@ -63,7 +63,7 @@ UI = {
         "caption": "Learn from history · Local PPT knowledge base first · Workplace safety notice",
         "settings": "Settings",
         "language": "Interface language",
-        "missing_deepseek": "DEEPSEEK_API_KEY is not set. Copy .env.example to .env.",
+        "missing_azure": "AZURE_OPENAI_API_KEY is not set. Copy .env.example to .env.",
         "missing_serper": "SERPER_API_KEY is not set. Copy .env.example to .env.",
         "alert_date": "Alert date (Hong Kong)",
         "date_hint": "Will search previous years for the same month-day **{month_day}**.",
@@ -202,8 +202,8 @@ st.caption(t["caption"])
 
 with st.sidebar:
     st.header(t["settings"])
-    if not os.getenv("DEEPSEEK_API_KEY"):
-        st.error(t["missing_deepseek"])
+    if not os.getenv("AZURE_OPENAI_API_KEY"):
+        st.error(t["missing_azure"])
     if not os.getenv("SERPER_API_KEY"):
         st.error(t["missing_serper"])
     query_day = _date_from_query()
@@ -214,7 +214,7 @@ with st.sidebar:
     st.caption(t["date_hint"].format(month_day=selected_day.strftime("%m-%d")))
 
     alert_key = f"{selected_day.isoformat()}|{language}"
-    can_call_llm = bool(os.getenv("DEEPSEEK_API_KEY"))
+    can_call_llm = bool(os.getenv("AZURE_OPENAI_API_KEY"))
     if can_call_llm and st.session_state.alert_key != alert_key:
         generate_and_store(selected_day, language)
     if st.button(t["generate"], use_container_width=True) and can_call_llm:

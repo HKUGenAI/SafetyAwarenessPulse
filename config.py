@@ -15,9 +15,13 @@ PPT_DIR = PROJECT_ROOT / "assets" / "ppts"
 DATA_DIR = PROJECT_ROOT / "data"
 EVENTS_DB_PATH = DATA_DIR / "events.db"
 
-# DeepSeek chat model (function calling is supported by deepseek-chat).
-DEEPSEEK_MODEL = "deepseek-chat"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+# Azure OpenAI (gpt-5.4-mini deployment).
+AZURE_OPENAI_ENDPOINT = os.getenv(
+    "AZURE_OPENAI_ENDPOINT", "https://mtr-project.openai.azure.com/"
+).rstrip("/") + "/"
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.4-mini")
+AZURE_OPENAI_MODEL_NAME = os.getenv("AZURE_OPENAI_MODEL_NAME", "gpt-5.4-mini")
 
 # Official Hong Kong Labour Department press-release listing (layer 2 after local DB).
 LABOUR_DEPT_NEWS_URL = "https://www.labour.gov.hk/tc/major/content.php"
