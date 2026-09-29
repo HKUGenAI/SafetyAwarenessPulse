@@ -6,7 +6,7 @@ Tools:
   A) search_local_work_accidents — SQLite lookup by date over the 4 Traditional Chinese PPTs
   B) search_labour_department — Hong Kong Labour Department press releases
      (https://www.labour.gov.hk/tc/major/content.php)
-  C) search_web — Tavily Search API for wider web lookup
+  C) search_web — Serper Google Search API for wider web lookup
 
 Priority (stop at the first hit):
   1. Local SQLite: working accidents on the same MM-DD in previous years
@@ -41,7 +41,6 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from langchain.tools import tool
 from langchain_deepseek import ChatDeepSeek
-from langchain_tavily import TavilySearch
 
 try:
     from langchain.agents import create_agent as _create_agent
@@ -58,12 +57,12 @@ from config import (
 )
 from document_ingest import parse_event_date
 from events_db import db_ready, fetch_by_month_day
+from multi_search_api import SmartSearchTool
 
 _MONTH_DAY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
 _ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
-_tavily: TavilySearch | None = None
-_tavily_labour: TavilySearch | None = None
+_serper: SmartSearchTool | None = None
 _agent = None
 
 
@@ -276,7 +275,7 @@ def date_keyword_variants(month_day: str, *, with_years: bool = True) -> list[st
 
 
 def compact_date_keywords(month_day: str) -> list[str]:
-    """Short, high-signal date spellings for Tavily / embedding queries."""
+    """Short, high-signal date spellings for Serper / local keyword queries."""
     month_day = normalize_month_day(month_day)
     month = int(month_day[:2])
     day = int(month_day[3:])
@@ -436,30 +435,12 @@ def ensure_events_db() -> None:
         )
 
 
-def get_tavily() -> TavilySearch:
-    global _tavily
-    if not os.getenv("TAVILY_API_KEY"):
-        raise RuntimeError("Missing TAVILY_API_KEY. Copy .env.example to .env and fill in the keys.")
-    if _tavily is None:
-        _tavily = TavilySearch(max_results=5, topic="general")
-    return _tavily
-
-
-def get_tavily_labour() -> TavilySearch:
-    """Tavily client locked to labour.gov.hk for layer-2 official news search."""
-    global _tavily_labour
-    if not os.getenv("TAVILY_API_KEY"):
-        raise RuntimeError("Missing TAVILY_API_KEY. Copy .env.example to .env and fill in the keys.")
-    if _tavily_labour is None:
-        try:
-            _tavily_labour = TavilySearch(
-                max_results=8,
-                topic="news",
-                include_domains=list(LABOUR_DEPT_DOMAINS),
-            )
-        except Exception:
-            _tavily_labour = TavilySearch(max_results=8, topic="news")
-    return _tavily_labour
+def get_serper() -> SmartSearchTool:
+    """Shared Serper client for web / labour-department search."""
+    global _serper
+    if _serper is None:
+        _serper = SmartSearchTool(default_max_results=8)
+    return _serper
 
 
 def _is_labour_accident_item(text: str) -> bool:
@@ -529,26 +510,27 @@ def labour_department_search(month_day: str, extra_query: str = "") -> dict[str,
     )
 
     listing_hits = fetch_labour_listing_for_day(month_day)
-    tavily_hits: list[dict[str, str]] = []
-    tavily_error = ""
+    serper_hits: list[dict[str, str]] = []
+    serper_error = ""
     try:
-        raw = get_tavily_labour().invoke(
-            {"query": query, "include_domains": list(LABOUR_DEPT_DOMAINS)}
+        serper_hits = get_serper().search_sync(
+            query,
+            max_results=8,
+            language="zh-hk",
+            news=True,
+            include_domains=list(LABOUR_DEPT_DOMAINS),
         )
-        tavily_hits = [
+        serper_hits = [
             item
-            for item in _parse_tavily_payload(raw)
-            if "labour.gov.hk" in (item.get("url") or "").lower()
-            or not item.get("url")
+            for item in serper_hits
+            if "labour.gov.hk" in (item.get("url") or "").lower() or not item.get("url")
         ]
-        if not tavily_hits:
-            tavily_hits = _parse_tavily_payload(raw)
     except Exception as exc:  # noqa: BLE001
-        tavily_error = str(exc)
+        serper_error = str(exc)
 
     merged: list[dict[str, str]] = list(listing_hits)
     seen = {(item.get("title"), item.get("url")) for item in merged}
-    for item in tavily_hits:
+    for item in serper_hits:
         key = (item.get("title"), item.get("url"))
         if key in seen:
             continue
@@ -562,8 +544,8 @@ def labour_department_search(month_day: str, extra_query: str = "") -> dict[str,
 
     if merged:
         return {"status": "ok", "results": merged, "month_day": month_day}
-    if tavily_error:
-        return {"status": "api_error", "error": tavily_error, "results": [], "month_day": month_day}
+    if serper_error:
+        return {"status": "api_error", "error": serper_error, "results": [], "month_day": month_day}
     return {"status": "empty", "results": [], "month_day": month_day}
 
 
@@ -622,46 +604,21 @@ def retrieve_local_work_accidents(month_day: str, extra_query: str = "") -> dict
     }
 
 
-def _parse_tavily_payload(raw: Any) -> list[dict[str, str]]:
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            text = raw.strip()
-            return [{"title": "", "url": "", "content": text}] if text else []
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    if not isinstance(raw, dict):
-        return [{"title": "", "url": "", "content": str(raw)}]
-
-    results = raw.get("results") or raw.get("result") or []
-    parsed: list[dict[str, str]] = []
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        parsed.append(
-            {
-                "title": str(item.get("title") or ""),
-                "url": str(item.get("url") or ""),
-                "content": str(item.get("content") or item.get("raw_content") or ""),
-            }
-        )
-    return parsed
-
-
 def web_search(query: str) -> dict[str, Any]:
-    """Call Tavily and normalize empty / error cases."""
+    """Call Serper and normalize empty / error cases."""
     query = (query or "").strip()
     if not query:
         return {"status": "empty_query", "results": []}
     try:
-        raw = get_tavily().invoke({"query": query})
+        results = get_serper().search_sync(
+            query,
+            max_results=5,
+            language="zh-hk",
+            news=False,
+        )
     except Exception as exc:  # noqa: BLE001
         return {"status": "api_error", "error": str(exc), "results": []}
 
-    results = _parse_tavily_payload(raw)
     nonempty = [item for item in results if (item.get("content") or item.get("title"))]
     if not nonempty:
         return {"status": "empty", "results": []}
@@ -745,7 +702,7 @@ def search_labour_department(month_day: str, extra_query: str = "") -> str:
         return f"[API_ERROR] 勞工處新聞公報搜尋失敗：{exc}"
 
     if payload["status"] == "api_error":
-        return f"[API_ERROR] 勞工處網站／Tavily 搜尋失敗：{payload.get('error', 'unknown error')}"
+        return f"[API_ERROR] 勞工處網站／Serper 搜尋失敗：{payload.get('error', 'unknown error')}"
     if payload["status"] == "empty" or not payload.get("results"):
         return (
             f"[NO_HITS] 勞工處新聞公報（{LABOUR_DEPT_NEWS_URL}）沒有找到 "
@@ -761,7 +718,7 @@ def search_labour_department(month_day: str, extra_query: str = "") -> str:
 
 @tool
 def search_web(query: str, month_day: str = "") -> str:
-    """Search the live web with Tavily. Use this only after BOTH local RAG and
+    """Search the live web with Serper. Use this only after BOTH local RAG and
     search_labour_department returned NO_HITS (or for follow-up questions).
 
     Write the target date in several forms in the query (9月16日, 09-16, 9.16,
@@ -798,7 +755,7 @@ def search_web(query: str, month_day: str = "") -> str:
     if payload["status"] == "empty_query":
         return "[EMPTY_SEARCH] 搜尋字串為空，請提供包含日期與主題的查詢。"
     if payload["status"] == "api_error":
-        return f"[API_ERROR] Tavily 搜尋失敗：{payload.get('error', 'unknown error')}"
+        return f"[API_ERROR] Serper 搜尋失敗：{payload.get('error', 'unknown error')}"
     if payload["status"] == "empty":
         return f"[EMPTY_SEARCH] 網路上沒有找到可用結果。查詢：{expanded}"
 
@@ -1282,7 +1239,7 @@ def interactive_chat(start_date: date, language: str = "zh-Hant") -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Workplace safety-alert agent (DeepSeek + RAG + Tavily).")
+    parser = argparse.ArgumentParser(description="Workplace safety-alert agent (DeepSeek + SQLite + Serper).")
     parser.add_argument("--date", help="Override Hong Kong date, YYYY-MM-DD or MM-DD.")
     parser.add_argument("--chat", action="store_true", help="Start an interactive terminal chatbot.")
     parser.add_argument(
@@ -1326,7 +1283,7 @@ if __name__ == "__main__":
 # Testing guide: verifying the 4-level fallback logic
 # ---------------------------------------------------------------------------
 # Prerequisites:
-#   1) Copy .env.example to .env and set DEEPSEEK_API_KEY + TAVILY_API_KEY
+#   1) Copy .env.example to .env and set DEEPSEEK_API_KEY + SERPER_API_KEY
 #   2) python document_ingest.py          # build data/events.db from ./assets/ppts
 #   3) python agent_mtr_bot.py --chat     # or: streamlit run streamlit_app.py
 #
@@ -1336,7 +1293,7 @@ if __name__ == "__main__":
 #   - 04-04-2023  港鐵灣仔站維修工於路軌跌倒
 #   - 01-03-2023  港鐵旺角站扶手梯維修
 #
-# Level ① Local SQLite date lookup (must stop here, do not call Tavily):
+# Level ① Local SQLite date lookup (must stop here, do not call Serper):
 #   python agent_mtr_bot.py --date 2026-12-29
 #   python agent_mtr_bot.py --date 2026-04-04
 #   Expected: tool trace contains only search_local_work_accidents
@@ -1360,7 +1317,7 @@ if __name__ == "__main__":
 #
 # Empty / error handling checks:
 #   - Delete or rename data/events.db then call local search → [ERROR] asking you to ingest first.
-#   - Temporarily set a bad TAVILY_API_KEY → [API_ERROR] without crashing the app.
+#   - Temporarily set a bad SERPER_API_KEY → [API_ERROR] without crashing the app.
 #   - Agent follow-up: after an alert is shown, ask「這次意外的主要風險是甚麼？」
 #     The chatbot should answer in Traditional Chinese, optionally calling tools again.
 #

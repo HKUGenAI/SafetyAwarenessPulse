@@ -13,7 +13,7 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 | Event store | Local **SQLite** (`data/events.db`); one row per accident; lookup by `month_day` |
 
 | PPT parsing | `python-pptx` (original Traditional Chinese text is **not** translated) |
-| Web search | [Serper](https://serper.dev/) Google Search API (`multi_search_api.SmartSearchTool`) / Tavily for some agent paths |
+| Web search | [Serper](https://serper.dev/) Google Search API (`multi_search_api.SmartSearchTool`) |
 | UI | Optional Streamlit local demo |
 | Discord | Channel broadcast via `discord_broadcast.py` (09:00 HK short reminder + in-app details) |
 
@@ -56,7 +56,7 @@ The four source decks already in `assets/ppts`:
 
 - Python 3.10 or newer
 - A [DeepSeek API key](https://platform.deepseek.com/)
-- A [Serper API key](https://serper.dev/) (and/or Tavily, depending on which web path you use)
+- A [Serper API key](https://serper.dev/)
 
 ## Setup
 
@@ -253,6 +253,71 @@ The DeepSeek model decides which tool to call. The daily-alert prompt forces thi
 - Daily alerts match by **month-day only** (`MM-DD` index), so 2023-04-04 can trigger an alert on 2026-04-04.
 - If several accidents share the same `MM-DD`, the daily alert **randomly picks one**.
 - The CLI / UI also accept `YYYY-MM-DD` and `MM-DD`.
+
+## Query the SQLite database (`data/events.db`)
+
+`data/events.db` is a local **SQLite** file. Table: `events`.
+
+| Column | Meaning |
+| --- | --- |
+| `id` | Primary key |
+| `iso_date` | Full date `YYYY-MM-DD` |
+| `month_day` | `MM-DD` (same-day-in-history lookup) |
+| `title` / `location` / `category` | Parsed fields |
+| `content` | Original Traditional Chinese PPT text |
+| `source_file` / `slide_number` | Source slide |
+
+### PowerShell one-liners
+
+Use parameterized `?` placeholders so quotes stay simple:
+
+```powershell
+# Count rows
+python -c "import sqlite3; c=sqlite3.connect(r'data\events.db'); print(list(c.execute('SELECT COUNT(*) FROM events')))"
+
+# Same month-day as the bot (e.g. 04-04)
+python -c "import sqlite3; c=sqlite3.connect(r'data\events.db'); print(list(c.execute('SELECT id, iso_date, title FROM events WHERE month_day = ?', ('04-04',))))"
+
+# Exact calendar date (zero-padded YYYY-MM-DD)
+python -c "import sqlite3; c=sqlite3.connect(r'data\events.db'); print(list(c.execute('SELECT id, title, location FROM events WHERE iso_date = ?', ('2023-04-04',))))"
+
+# Keyword search in title / body
+python -c "import sqlite3; c=sqlite3.connect(r'data\events.db'); print(list(c.execute('SELECT id, iso_date, title FROM events WHERE content LIKE ? OR title LIKE ?', ('%港鐵%', '%港鐵%'))))"
+```
+
+### Interactive `sqlite3` CLI (if installed)
+
+```powershell
+sqlite3 data\events.db
+```
+
+```sql
+.headers on
+.mode column
+
+SELECT COUNT(*) FROM events;
+
+SELECT id, iso_date, title, location
+FROM events
+WHERE month_day = '04-04';
+
+SELECT id, title, location
+FROM events
+WHERE iso_date = '2023-04-04';
+
+SELECT content FROM events WHERE id = 1;
+```
+
+Type `.quit` to exit.
+
+### Helpers in `events_db.py`
+
+```python
+from events_db import fetch_by_month_day, fetch_by_iso_date
+
+print(fetch_by_month_day("04-04"))
+print(fetch_by_iso_date("2023-04-04"))
+```
 
 ## Error handling
 
