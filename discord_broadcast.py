@@ -1,9 +1,9 @@
 """
 Discord broadcaster for the daily short safety reminder.
 
-Posts one Traditional Chinese 30–50 character reminder to a Discord channel
-every day at 09:00 Asia/Hong_Kong (configurable), with an "了解更多" button
-that reveals the full event details inside Discord (no external website).
+Posts a Traditional Chinese reminder (news sentence + safety tip) to a Discord
+channel every day at 09:00 Asia/Hong_Kong (configurable), with a "閱讀全文"
+button that shows that incident's news story inside Discord (not a source list).
 
 Usage:
     python discord_broadcast.py --once          # send now, then keep bot online
@@ -131,7 +131,7 @@ class DetailButton(discord.ui.Button):
 
     def __init__(self, iso_date: str):
         super().__init__(
-            label="了解更多",
+            label="閱讀全文",
             style=discord.ButtonStyle.primary,
             custom_id=f"{CUSTOM_ID_PREFIX}{iso_date}",
         )
@@ -256,7 +256,7 @@ def main() -> None:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Send one reminder now (bot stays online so 了解更多 keeps working).",
+        help="Send one reminder now (bot stays online so 閱讀全文 keeps working).",
     )
     parser.add_argument(
         "--date",

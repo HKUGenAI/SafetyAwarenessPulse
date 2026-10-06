@@ -38,7 +38,7 @@ SafetyAwarenessPulse/
 ├── document_ingest.py        # Load PPT slides → structured events → SQLite
 ├── multi_search_api.py       # Serper SmartSearchTool (cache + rate limits)
 ├── agent_mtr_bot.py          # Azure OpenAI agent + three tools + CLI chatbot
-├── discord_broadcast.py      # Daily 09:00 HK Discord short reminder + 了解更多
+├── discord_broadcast.py      # Daily 09:00 HK Discord reminder + 閱讀全文
 ├── streamlit_app.py          # Optional local Traditional Chinese web demo
 ├── requirements.txt
 ├── .env.example
@@ -171,7 +171,12 @@ In the UI:
 
 ## Discord channel broadcast
 
-Every day at **09:00 Asia/Hong_Kong**, a short Traditional Chinese reminder (~30–50 characters) is posted to your Discord channel, with an **了解更多** button. Clicking the button shows the **full event details inside Discord** (ephemeral reply) — not an external website.
+Every day at **09:00 Asia/Hong_Kong**, Discord gets a short Traditional Chinese post:
+
+1. One **news sentence** (date, place, what happened, and why), e.g. `2023年4月4日，港鐵灣仔站有維修工因未注意路軌環境跌倒受傷。`
+2. One **safety tip**.
+
+The **閱讀全文** button shows **date + that incident's news story** (original PPT wording when available). It does not show `[HITS]`, source-file metadata, fallback-level labels, or a list of search URLs.
 
 ### 1. Create the Discord bot
 
@@ -189,7 +194,7 @@ python discord_broadcast.py --once
 python discord_broadcast.py --once --date 2026-04-04
 ```
 
-`--once` posts immediately, then **keeps the bot online** so **了解更多** still works. Stop with Ctrl+C.
+`--once` posts immediately, then **keeps the bot online** so **閱讀全文** still works. Stop with Ctrl+C.
 
 ### 3. Run the daily scheduler
 
@@ -301,7 +306,7 @@ If `data/events.db` is missing and PPTs are present:
 python document_ingest.py --reset
 ```
 
-Smoke-test once (bot stays online for the **了解更多** button):
+Smoke-test once (bot stays online for the **閱讀全文** button):
 
 ```bash
 python discord_broadcast.py --once

@@ -1044,71 +1044,203 @@ def _clip_reminder(text: str, *, min_chars: int = 30, max_chars: int = 50) -> st
     return cleaned
 
 
-def _fallback_short_from_evidence(evidence: str) -> str:
-    """Heuristic short line when the LLM is unavailable."""
-    lines = [line.strip() for line in (evidence or "").splitlines() if line.strip()]
-    body = ""
-    for line in lines:
-        if line.startswith("[") or line.startswith("來源") or line.startswith("網址"):
+def _extract_primary_news(evidence: str) -> str:
+    """Keep the first news article; drop tool headers, PPT metadata, and URL lists."""
+    text = (evidence or "").strip()
+    if not text:
+        return ""
+    text = re.sub(
+        r"^\[(?:HITS|WEB_HITS|NO_HITS|ERROR|API_ERROR|EMPTY_SEARCH)\][^\n]*\n*",
+        "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"^以下為原文[^\n]*\n+", "", text)
+    parts = re.split(r"\n-{3,}\n", text)
+    part = (parts[0] if parts else text).strip()
+    kept: list[str] = []
+    skip_source_block = False
+    for line in part.splitlines():
+        stripped = line.strip()
+        if skip_source_block:
+            if not stripped:
+                skip_source_block = False
             continue
-        if "-----" in line:
+        if re.match(r"^\[\d+\]", stripped):
             continue
-        body = line
+        if stripped.startswith("網址："):
+            continue
+        if stripped.startswith("來源檔案") or stripped.startswith("來源層級"):
+            continue
+        if re.match(r"^分類\s*[:：]", stripped):
+            continue
+        if re.match(r"^資料來源\s*[:：]?", stripped):
+            skip_source_block = True
+            continue
+        if re.match(r"^意外簡述\s*[:：]?\s*$", stripped):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept).strip()
+
+
+def _iso_to_zh_date(iso_date: str) -> str:
+    parts = (iso_date or "").split("-")
+    if len(parts) != 3:
+        return iso_date
+    return f"{int(parts[0])}年{int(parts[1])}月{int(parts[2])}日"
+
+
+def _event_iso_from_news(news: str, fallback_iso: str) -> str:
+    """Prefer the accident date inside the clipping, not today's lookup date."""
+    field = re.search(
+        r"日期\s*[:：]\s*(\d{1,2})[-/.](\d{1,2})[-/.](19\d{2}|20\d{2})",
+        news or "",
+    )
+    if field:
+        day, month, year = field.group(1), field.group(2), field.group(3)
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    iso = re.search(r"(19\d{2}|20\d{2})-(\d{2})-(\d{2})", news or "")
+    if iso:
+        return f"{iso.group(1)}-{iso.group(2)}-{iso.group(3)}"
+    chinese = re.search(
+        r"(19\d{2}|20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+        news or "",
+    )
+    if chinese:
+        return (
+            f"{int(chinese.group(1)):04d}-"
+            f"{int(chinese.group(2)):02d}-"
+            f"{int(chinese.group(3)):02d}"
+        )
+    return fallback_iso
+
+
+def _clean_worker_article(news: str, event_iso: str) -> str:
+    """Drop duplicate date lines; keep title, place, and story for workers."""
+    kept: list[str] = []
+    for line in (news or "").splitlines():
+        stripped = line.strip()
+        if re.match(r"^日期\s*[:：]", stripped):
+            continue
+        kept.append(line.rstrip())
+    body = "\n".join(kept).strip()
+    header = f"日期：{_iso_to_zh_date(event_iso)}"
+    if not body:
+        return header
+    return f"{header}\n\n{body}"
+
+
+def _looks_like_source_list(text: str) -> bool:
+    """True when the blob is a search-result dump rather than one news story."""
+    if not text:
+        return True
+    if text.count("網址：") >= 2:
+        return True
+    numbered = len(re.findall(r"^\[\d+\]\s", text, flags=re.M))
+    return numbered >= 3 and "意外簡述" not in text
+
+
+def _fallback_short_from_news(news: str, iso_date: str) -> str:
+    """Build a teaser without the LLM: first news line + a generic safety tip."""
+    title = ""
+    for line in (news or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("日期") or stripped.startswith("地點") or stripped.startswith("分類"):
+            continue
+        title = stripped
         break
-    if not body and lines:
-        body = lines[-1]
-    # Prefer a practical reminder framing.
-    if "意外" in body or "事故" in body:
-        return _clip_reminder(f"往年今日曾發生工業意外，請提高警覺並做好防護。")
-    return _clip_reminder(body or "今日請留意職安風險，工作前先檢查防護。")
+    year, month, day = iso_date.split("-")
+    date_zh = f"{int(year)}年{int(month)}月{int(day)}日"
+    if title:
+        incident = f"{date_zh}，{title.rstrip('。')}。"
+    else:
+        incident = f"{date_zh}，往年同日曾發生工業意外。"
+    tip = "工作前請檢查防護裝備，並遵守安全程序。"
+    return f"{incident}\n{tip}"
+
+
+def _parse_llm_news_blocks(raw: str) -> dict[str, str]:
+    """Parse INCIDENT: / TIP: / ARTICLE: blocks from the model."""
+    out = {"incident": "", "tip": "", "article": ""}
+    current = ""
+    chunks: dict[str, list[str]] = {"incident": [], "tip": [], "article": []}
+    for line in (raw or "").splitlines():
+        match = re.match(r"^(INCIDENT|TIP|ARTICLE)\s*[:：]\s*(.*)$", line.strip(), flags=re.I)
+        if match:
+            current = match.group(1).lower()
+            rest = match.group(2).strip()
+            if rest:
+                chunks[current].append(rest)
+            continue
+        if current:
+            chunks[current].append(line)
+    for key, lines in chunks.items():
+        out[key] = "\n".join(lines).strip()
+    return out
 
 
 def generate_short_reminder(
     target: date | None = None,
 ) -> dict[str, Any]:
     """
-    Build a Discord-ready safety reminder: Traditional Chinese, ~30–50 characters.
+    Build a Discord-ready safety reminder.
 
-    Uses the deterministic 4-level pipeline for evidence, then Azure OpenAI to compress.
-    Returns detail_text (full event evidence) for the in-Discord "了解更多" button.
+    Channel post: one news sentence (date / place / what happened / why) plus a
+    short safety tip. 「閱讀全文」 shows only the date and that news story.
     """
     target = target or today_in_hong_kong()
     month_day = to_month_day(target)
     iso_date = target.isoformat()
 
     pipeline = run_priority_pipeline(month_day)
-    evidence = str(pipeline.get("evidence") or "")[:3500]
+    evidence = str(pipeline.get("evidence") or "")[:4000]
     level_label = str(pipeline.get("label") or "")
-    detail_text = _format_detail_for_discord(
-        iso_date=iso_date,
-        month_day=month_day,
-        level_label=level_label,
-        evidence=evidence,
-    )
+    news = _extract_primary_news(evidence)
+    need_written_article = _looks_like_source_list(news) or not news
 
     prompt = (
-        "你是職場安全短訊編輯。根據下列資料，寫一句繁體中文（香港用詞）每日安全提醒。\n"
-        "硬性要求：\n"
-        "1. 只輸出提醒正文本身，不要標題、不要引號、不要來源、不要連結。\n"
-        "2. 長度必須約 30 至 50 個字（含標點），寧可精簡。\n"
-        "3. 內容要可執行（提醒防護／檢查／程序），不要長篇敘述案情。\n"
-        f"日期：{iso_date}（月日 {month_day}）\n"
-        f"資料層級：{level_label}\n"
-        f"資料：\n{evidence}\n"
+        "你是香港職安新聞編輯。根據資料撰寫繁體中文（香港用詞）。\n"
+        "只輸出以下三個標記，不要其他說明：\n"
+        "INCIDENT: （一句案情。必須包含日期、地點、發生了甚麼、主要原因（資料有則寫）。"
+        "例如：2023年4月4日，港鐵灣仔站有維修工因未注意路軌環境跌倒受傷。）\n"
+        "TIP: （一句可執行的安全提醒，約20至40字。）\n"
+        "ARTICLE: （一篇約150至400字的新聞報道，只寫這一起事件的經過。"
+        "只寫日期與案情正文。不要寫[HITS]、來源檔案、來源層級、分類、資料來源、網址清單。）\n"
+        f"今日查詢日期：{iso_date}（月日 {month_day}）\n"
+        f"資料：\n{news or evidence}\n"
     )
 
     text = ""
     error = None
+    written_article = ""
     try:
         llm = build_llm()
         response = llm.invoke(prompt)
-        text = getattr(response, "content", None) or str(response)
-        if isinstance(text, list):
-            text = "".join(str(part) for part in text)
-        text = _clip_reminder(str(text).strip())
+        raw = getattr(response, "content", None) or str(response)
+        if isinstance(raw, list):
+            raw = "".join(str(part) for part in raw)
+        blocks = _parse_llm_news_blocks(str(raw).strip())
+        incident = (blocks.get("incident") or "").strip()
+        tip = (blocks.get("tip") or "").strip()
+        written_article = (blocks.get("article") or "").strip()
+        if not incident:
+            incident = _fallback_short_from_news(news, iso_date).split("\n", 1)[0]
+        if not tip:
+            tip = "工作前請檢查防護裝備，並遵守安全程序。"
+        text = f"{incident}\n{tip}"
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
-        text = _fallback_short_from_evidence(evidence)
+        text = _fallback_short_from_news(news, iso_date)
+
+    if need_written_article:
+        article = written_article or news or "（暫無詳細新聞內容）"
+    else:
+        article = news
+
+    event_iso = _event_iso_from_news(news or article, iso_date)
+    detail_text = _clean_worker_article(article, event_iso)
 
     return {
         "text": text,
@@ -1119,25 +1251,6 @@ def generate_short_reminder(
         "char_count": _count_zh_chars(text),
         "error": error,
     }
-
-
-def _format_detail_for_discord(
-    *,
-    iso_date: str,
-    month_day: str,
-    level_label: str,
-    evidence: str,
-) -> str:
-    """Format the full event evidence shown when the user clicks 了解更多."""
-    body = (evidence or "").strip() or "（暫無詳細資料）"
-    header = (
-        f"【事件詳情】\n"
-        f"日期：{iso_date}（月日 {month_day}）\n"
-        f"來源層級：{level_label or '未知'}\n"
-        f"{'─' * 16}\n"
-    )
-    # Discord message limit is 2000; leave room for header when splitting later.
-    return header + body
 
 
 def infer_fallback_level(trace: list[str], text: str) -> str:
