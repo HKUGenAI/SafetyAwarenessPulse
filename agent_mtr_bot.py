@@ -1140,6 +1140,20 @@ def _looks_like_source_list(text: str) -> bool:
     return numbered >= 3 and "意外簡述" not in text
 
 
+def _is_mostly_traditional_chinese(text: str) -> bool:
+    """True when the body is mainly CJK (safe to show workers without rewrite)."""
+    if not (text or "").strip():
+        return False
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    if cjk < 8:
+        return False
+    # Short lines (channel teaser): need clear CJK majority.
+    if cjk < 40:
+        return cjk >= max(8, latin)
+    return cjk >= latin * 2
+
+
 def _fallback_short_from_news(news: str, iso_date: str) -> str:
     """Build a teaser without the LLM: first news line + a generic safety tip."""
     title = ""
@@ -1149,11 +1163,15 @@ def _fallback_short_from_news(news: str, iso_date: str) -> str:
             continue
         if stripped.startswith("日期") or stripped.startswith("地點") or stripped.startswith("分類"):
             continue
+        # Never paste an English / URL dump line into the channel teaser.
+        if not _is_mostly_traditional_chinese(stripped) and re.search(r"[A-Za-z]{6,}", stripped):
+            continue
+        if stripped.startswith("http") or "網址" in stripped:
+            continue
         title = stripped
         break
-    year, month, day = iso_date.split("-")
-    date_zh = f"{int(year)}年{int(month)}月{int(day)}日"
-    if title:
+    date_zh = _iso_to_zh_date(iso_date)
+    if title and _is_mostly_traditional_chinese(title):
         incident = f"{date_zh}，{title.rstrip('。')}。"
     else:
         incident = f"{date_zh}，往年同日曾發生工業意外。"
@@ -1181,6 +1199,48 @@ def _parse_llm_news_blocks(raw: str) -> dict[str, str]:
     return out
 
 
+def _rewrite_article_to_zh_hant(
+    source: str,
+    *,
+    iso_date: str,
+    fallback: str = "",
+) -> str:
+    """Force a Traditional Chinese news body for 「閱讀全文」."""
+    source = (source or "").strip()
+    if not source and not (fallback or "").strip():
+        return "（暫無詳細新聞內容）"
+    prompt = (
+        "請把下列資料改寫成一篇繁體中文（香港用詞）新聞報道，約150至400字。\n"
+        "硬性要求：\n"
+        "1. 全文必須是繁體中文，禁止英文句子或英文段落。\n"
+        "2. 只寫這一起事件／事實的經過；不要網址、搜尋結果清單、[HITS]、來源檔案。\n"
+        "3. 不得捏造資料沒有的事實。\n"
+        "4. 只輸出報道正文本身，不要標題標記。\n"
+        f"查詢日期：{iso_date}\n"
+        f"資料：\n{(source or fallback)[:3500]}\n"
+    )
+    try:
+        llm = build_llm()
+        response = llm.invoke(prompt)
+        raw = getattr(response, "content", None) or str(response)
+        if isinstance(raw, list):
+            raw = "".join(str(part) for part in raw)
+        text = str(raw).strip()
+        if _is_mostly_traditional_chinese(text):
+            return text
+    except Exception:  # noqa: BLE001
+        pass
+    # Last resort: never show raw English to workers.
+    if _is_mostly_traditional_chinese(fallback):
+        return fallback.strip()
+    if _is_mostly_traditional_chinese(source):
+        return source
+    return (
+        f"{_iso_to_zh_date(iso_date)}，往年同日有相關紀錄，"
+        "惟暫未能以繁體中文整理詳細案情。請留意職安風險並遵守安全程序。"
+    )
+
+
 def generate_short_reminder(
     target: date | None = None,
 ) -> dict[str, Any]:
@@ -1198,15 +1258,22 @@ def generate_short_reminder(
     evidence = str(pipeline.get("evidence") or "")[:4000]
     level_label = str(pipeline.get("label") or "")
     news = _extract_primary_news(evidence)
-    need_written_article = _looks_like_source_list(news) or not news
+    # Always rewrite into Traditional Chinese when source is English / a URL dump.
+    must_rewrite = (
+        not news
+        or _looks_like_source_list(news)
+        or not _is_mostly_traditional_chinese(news)
+    )
 
     prompt = (
-        "你是香港職安新聞編輯。根據資料撰寫繁體中文（香港用詞）。\n"
+        "你是香港職安新聞編輯。\n"
+        "硬性語言要求：INCIDENT、TIP、ARTICLE 三部分的全部文字必須是繁體中文（香港用詞）。\n"
+        "禁止輸出英文句子或英文段落；若資料是英文／其他語言，必須改寫成繁體中文後再輸出。\n"
         "只輸出以下三個標記，不要其他說明：\n"
         "INCIDENT: （一句案情。必須包含日期、地點、發生了甚麼、主要原因（資料有則寫）。"
         "例如：2023年4月4日，港鐵灣仔站有維修工因未注意路軌環境跌倒受傷。）\n"
-        "TIP: （一句可執行的安全提醒，約20至40字。）\n"
-        "ARTICLE: （一篇約150至400字的新聞報道，只寫這一起事件的經過。"
+        "TIP: （一句可執行的安全提醒，約20至40字，繁體中文。）\n"
+        "ARTICLE: （一篇約150至400字的繁體中文新聞報道，只寫這一起事件的經過。"
         "只寫日期與案情正文。不要寫[HITS]、來源檔案、來源層級、分類、資料來源、網址清單。）\n"
         f"今日查詢日期：{iso_date}（月日 {month_day}）\n"
         f"資料：\n{news or evidence}\n"
@@ -1229,15 +1296,50 @@ def generate_short_reminder(
             incident = _fallback_short_from_news(news, iso_date).split("\n", 1)[0]
         if not tip:
             tip = "工作前請檢查防護裝備，並遵守安全程序。"
+        # If the model leaked English into the channel teaser, fall back.
+        if not _is_mostly_traditional_chinese(incident) and re.search(r"[A-Za-z]{8,}", incident):
+            incident = _fallback_short_from_news(news, iso_date).split("\n", 1)[0]
         text = f"{incident}\n{tip}"
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
         text = _fallback_short_from_news(news, iso_date)
 
-    if need_written_article:
-        article = written_article or news or "（暫無詳細新聞內容）"
-    else:
+    # Channel post must stay Traditional Chinese.
+    if not _is_mostly_traditional_chinese(text) or re.search(
+        r"[A-Za-z]{12,}", text or ""
+    ):
+        text = _fallback_short_from_news(
+            news if _is_mostly_traditional_chinese(news) else "",
+            iso_date,
+        )
+
+    if must_rewrite:
+        article = written_article
+        if not _is_mostly_traditional_chinese(article):
+            article = _rewrite_article_to_zh_hant(
+                news or evidence,
+                iso_date=iso_date,
+                fallback=written_article or news,
+            )
+    elif _is_mostly_traditional_chinese(news):
+        # Keep original Traditional Chinese PPT wording for workers.
         article = news
+    else:
+        article = written_article or news or "（暫無詳細新聞內容）"
+
+    if not (article or "").strip():
+        article = "（暫無詳細新聞內容）"
+
+    # 「閱讀全文」 final gate: never show non-Chinese / source dumps.
+    if (
+        not _is_mostly_traditional_chinese(article)
+        or _looks_like_source_list(article)
+    ):
+        article = _rewrite_article_to_zh_hant(
+            news or evidence or article,
+            iso_date=iso_date,
+            fallback=written_article or article,
+        )
 
     event_iso = _event_iso_from_news(news or article, iso_date)
     detail_text = _clean_worker_article(article, event_iso)
