@@ -1712,7 +1712,10 @@ def run_priority_pipeline(
     month_day = normalize_month_day(month_day)
     center = center_date or today_in_hong_kong()
 
-    level1 = search_local_work_accidents.invoke({"month_day": month_day, "extra_query": "工業意外"})
+    # Do not pass extra_query here: it is a hard LIKE filter and would drop
+    # valid same-day PPT cuttings that never contain the exact words「工業意外」
+    # (e.g. 2025-10-18 華懋大廈棚架火警).
+    level1 = search_local_work_accidents.invoke({"month_day": month_day, "extra_query": ""})
     if level1.startswith("[HITS]"):
         return {"level": 1, "label": "① 本地 PPT 工作意外", "evidence": level1}
 
