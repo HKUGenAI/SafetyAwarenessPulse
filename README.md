@@ -22,7 +22,7 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 1. **Local SQLite** — `WHERE month_day = MM-DD` against events ingested from the 4 PPTs.
 2. **Labour Department press releases** — search [labour.gov.hk news](https://www.labour.gov.hk/tc/major/content.php) for workplace accidents on this day.
 3. **World workplace web search** — lookup for working accidents worldwide on this day.
-4. **Recent construction recall** — if levels 1–3 miss, recall a construction / building-site accident from nearby `MM-DD` days in SQLite (±7 by default), else recent construction accidents on the web.
+4. **Recent construction recall** — if levels 1–3 miss, recall a construction / building-site accident from the past N **calendar** days relative to the alert date (usually the same year; default 7), via SQLite `iso_date` range then web. Not historical neighbouring `MM-DD`s.
 
 All **user-facing** answers are Traditional Chinese. Retrieved PPT wording is kept in the original Traditional Chinese; it is never translated.
 
@@ -367,7 +367,7 @@ sudo systemctl status safety-discord
 | `search_local_work_accidents` | Query SQLite by `month_day` (`MM-DD`). If several accidents match, **one is chosen at random**. Returns original PPT text or `[NO_HITS]`. |
 | `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local DB. |
 | `search_web` | Web search. Used for level 3 (same-day world workplace) and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
-| `search_recent_construction_accidents` | Level 4: nearby construction / site accidents in SQLite, else recent construction web results. |
+| `search_recent_construction_accidents` | Level 4: construction / site accidents in the past N calendar days (`iso_date`), else recent web results. |
 
 The Azure OpenAI model decides which tool to call. The daily-alert prompt forces this order: local SQLite first, then the Labour Department site, then world workplace search, then recent construction-accident recall.
 
@@ -493,12 +493,12 @@ If the Labour Department listing also has no workplace accident for that `MM-DD`
 
 ### Level 4 — recent construction recall
 
-If levels 1–3 all miss, `search_recent_construction_accidents` runs:
+If levels 1–3 all miss, `search_recent_construction_accidents` runs with the alert `YYYY-MM-DD`:
 
-1. Local SQLite construction / site keywords on nearby `MM-DD` (±`RECENT_CONSTRUCTION_DAYS`, default 7)
-2. Otherwise a Serper web search for recent Hong Kong construction / site accidents (no same-day date filter)
+1. Local SQLite construction / site events whose `iso_date` falls in the past `RECENT_CONSTRUCTION_DAYS` calendar days (same year window, e.g. 2026-10-08…2026-10-15)
+2. Otherwise a Serper web search for Hong Kong construction / site accidents in that recent window
 
-The UI remains Traditional Chinese and still frames a workplace safety notice (not trivia).
+This is **not** historical neighbouring `MM-DD`s from other years. The UI remains Traditional Chinese and still frames a workplace safety notice.
 
 ### Error-path checks
 

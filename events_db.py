@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import random
 import sqlite3
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -232,71 +231,54 @@ def fetch_by_iso_date(
     return [_row_to_event(row) for row in rows]
 
 
-def nearby_month_days(month_day: str, *, days: int = 7) -> list[tuple[int, str]]:
-    """
-    Return (distance, MM-DD) for neighbours within ±days, excluding the centre day.
-
-    Ordered by absolute distance ascending (1 … days). Uses a leap-year anchor
-    so Feb 29 is valid.
-    """
-    month_day = (month_day or "").strip()
-    if len(month_day) != 5 or month_day[2] != "-":
-        return []
-    try:
-        month, day = int(month_day[:2]), int(month_day[3:])
-        anchor = date(2024, month, day)
-    except ValueError:
-        return []
-
-    out: list[tuple[int, str]] = []
-    for distance in range(1, max(0, int(days)) + 1):
-        for delta in (-distance, distance):
-            neighbour = (anchor + timedelta(days=delta)).strftime("%m-%d")
-            out.append((distance, neighbour))
-    return out
-
-
-def fetch_nearby_construction_events(
-    month_day: str,
+def fetch_recent_construction_by_iso_range(
+    start_iso: str,
+    end_iso: str,
     *,
-    days: int = 7,
     keywords: tuple[str, ...] | list[str] = (),
+    exclude_iso: str = "",
     db_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Recall construction-related events on nearby MM-DDs (not the exact day).
+    Recall construction-related events by real calendar dates (YYYY-MM-DD).
 
-    Prefers closer calendar days. When several match on the closest day that
-    has hits, all of that day's matches are returned (caller may pick one).
+    Used for level-4 "近日": same year as the alert day, within a short window
+    ending at end_iso (typically the past N days). Prefers newer iso_date first.
     """
-    month_day = (month_day or "").strip()
+    start_iso = (start_iso or "").strip()
+    end_iso = (end_iso or "").strip()
+    exclude_iso = (exclude_iso or "").strip()
     keys = [k.strip() for k in keywords if (k or "").strip()]
-    if not month_day or not keys:
+    if not start_iso or not end_iso or not keys:
         return []
+
+    clauses = " OR ".join(
+        "(content LIKE ? OR title LIKE ? OR location LIKE ? OR category LIKE ?)"
+        for _ in keys
+    )
+    params: list[Any] = [start_iso, end_iso]
+    for key in keys:
+        like = f"%{key}%"
+        params.extend([like, like, like, like])
+
+    exclude_sql = ""
+    if exclude_iso:
+        exclude_sql = " AND iso_date != ?"
+        params.append(exclude_iso)
 
     with connect(db_path) as conn:
         init_db(conn)
-        for _distance, neighbour in nearby_month_days(month_day, days=days):
-            clauses = " OR ".join(
-                "(content LIKE ? OR title LIKE ? OR location LIKE ? OR category LIKE ?)"
-                for _ in keys
-            )
-            params: list[Any] = [neighbour]
-            for key in keys:
-                like = f"%{key}%"
-                params.extend([like, like, like, like])
-            rows = conn.execute(
-                f"""
-                SELECT * FROM events
-                WHERE month_day = ?
-                  AND ({clauses})
-                ORDER BY iso_date, id
-                """,
-                params,
-            ).fetchall()
-            if rows:
-                return [_row_to_event(row) for row in rows]
-    return []
+        rows = conn.execute(
+            f"""
+            SELECT * FROM events
+            WHERE iso_date >= ? AND iso_date <= ?
+              AND ({clauses})
+              {exclude_sql}
+            ORDER BY iso_date DESC, id
+            """,
+            params,
+        ).fetchall()
+    return [_row_to_event(row) for row in rows]
 
 
 def count_events(db_path: Path | None = None) -> int:

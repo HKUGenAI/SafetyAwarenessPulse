@@ -12,7 +12,7 @@ Priority (stop at the first hit):
   1. Local SQLite: working accidents on the same MM-DD in previous years
   2. Labour Department news: https://www.labour.gov.hk/tc/major/content.php
   3. Web: working accidents around the world on this day
-  4. Recall recent construction-related accidents (nearby MM-DD / recent web)
+  4. Recall construction accidents from the last few calendar days (same year)
 
 All user-facing answers are Traditional Chinese. PPT source text is never translated.
 """
@@ -28,7 +28,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -60,7 +60,7 @@ from config import (
     RECENT_CONSTRUCTION_DAYS,
 )
 from document_ingest import parse_event_date
-from events_db import db_ready, fetch_by_month_day, fetch_nearby_construction_events
+from events_db import db_ready, fetch_by_month_day, fetch_recent_construction_by_iso_range
 from multi_search_api import SmartSearchTool
 
 _MONTH_DAY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
@@ -726,29 +726,70 @@ def search_labour_department(month_day: str, extra_query: str = "") -> str:
     return header + _format_web_hits(payload["results"])
 
 
+def _recent_calendar_window(center: date, days: int) -> tuple[date, date]:
+    """Past N calendar days up to centre (same year / real dates, not MM-DD history)."""
+    window = max(1, int(days))
+    end = center
+    start = center - timedelta(days=window)
+    return start, end
+
+
+def _recent_date_query_bits(center: date, days: int) -> str:
+    """Date phrases for web search covering the recent calendar window."""
+    bits: list[str] = [
+        f"{center.year}年",
+        f"{center.year}",
+        f"{center.month}月",
+        "近日",
+    ]
+    for delta in range(0, max(1, int(days)) + 1):
+        day = center - timedelta(days=delta)
+        bits.append(f"{day.month}月{day.day}日")
+        bits.append(day.isoformat())
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for bit in bits:
+        if bit not in seen:
+            seen.add(bit)
+            out.append(bit)
+    return " ".join(out)
+
+
 def retrieve_recent_construction_accidents(
-    month_day: str,
+    center_date: date | str,
     *,
     days: int | None = None,
 ) -> dict[str, Any]:
     """
-    Level-4 recall: construction accidents on nearby MM-DDs in the local DB,
-    then (if empty) recent construction accidents on the open web.
+    Level-4 recall: construction accidents in the last few *calendar* days
+    relative to the alert date (usually the same year), not historical MM-DD neighbours.
     """
-    month_day = normalize_month_day(month_day)
+    if isinstance(center_date, str):
+        center = today_in_hong_kong(center_date)
+    else:
+        center = center_date
     window = int(days if days is not None else RECENT_CONSTRUCTION_DAYS)
+    start, end = _recent_calendar_window(center, window)
+    start_iso, end_iso = start.isoformat(), end.isoformat()
+
     candidates: list[dict[str, Any]] = []
     try:
         ensure_events_db()
-        candidates = fetch_nearby_construction_events(
-            month_day,
-            days=window,
+        candidates = fetch_recent_construction_by_iso_range(
+            start_iso,
+            end_iso,
             keywords=CONSTRUCTION_KEYWORDS,
+            exclude_iso="",  # include centre day if the DB has that absolute date
         )
     except KnowledgeBaseError:
         candidates = []
+
     if candidates:
-        event = random.choice(candidates)
+        # Prefer the most recent iso_date (list already DESC); random among that day.
+        newest = candidates[0]["iso_date"]
+        same_day = [event for event in candidates if event["iso_date"] == newest]
+        event = random.choice(same_day)
         hit = {
             "content": event["content"],
             "metadata": {
@@ -761,11 +802,13 @@ def retrieve_recent_construction_accidents(
                 "source_file": event["source_file"],
                 "slide_number": event["slide_number"],
                 "language": event["language"],
-                "recall": "nearby_construction",
+                "recall": "recent_calendar_construction",
             },
         }
         return {
-            "month_day": month_day,
+            "iso_date": center.isoformat(),
+            "start_iso": start_iso,
+            "end_iso": end_iso,
             "days": window,
             "source": "local",
             "hits": [hit],
@@ -773,9 +816,10 @@ def retrieve_recent_construction_accidents(
             "web_results": [],
         }
 
+    date_bits = _recent_date_query_bits(center, window)
     web_query = (
-        "香港 近日 地盤 建築 工程 工業意外 工作意外 "
-        "Hong Kong recent construction site workplace accident"
+        f"香港 地盤 建築 工程 工業意外 工作意外 {date_bits} "
+        f"Hong Kong construction site accident {center.year}"
     )
     payload = web_search(web_query)
     results = [
@@ -785,7 +829,9 @@ def retrieve_recent_construction_accidents(
         and is_work_accident_related(_web_item_blob(item))
     ]
     return {
-        "month_day": month_day,
+        "iso_date": center.isoformat(),
+        "start_iso": start_iso,
+        "end_iso": end_iso,
         "days": window,
         "source": "web" if results else "none",
         "hits": [],
@@ -798,22 +844,25 @@ def retrieve_recent_construction_accidents(
 
 
 @tool
-def search_recent_construction_accidents(month_day: str, days: int = 7) -> str:
-    """Recall construction-related accidents from recent / nearby days.
+def search_recent_construction_accidents(iso_date: str, days: int = 7) -> str:
+    """Recall construction-related accidents from the last few calendar days.
 
     Use ONLY as layer ④ after local same-day, Labour Department, and world
     same-day workplace searches all returned NO_HITS / EMPTY_SEARCH.
 
-    First searches the local PPT SQLite for construction accidents on nearby
-    MM-DDs (±days, excluding the exact day). If none, searches the web for
-    recent Hong Kong construction / site accidents (no same-day date filter).
+    "Recent" means real calendar proximity to iso_date (usually the same year),
+    e.g. for 2026-10-15 look at 2026-10-08 … 2026-10-15 — NOT historical
+    neighbouring MM-DDs in other years.
+
+    First searches local SQLite by iso_date range; if none, searches the web
+    for Hong Kong construction / site accidents in that recent window.
 
     Args:
-        month_day: Centre month-day MM-DD (example: 10-15).
-        days: Neighbour window in calendar days (default 7).
+        iso_date: Alert day as YYYY-MM-DD (example: 2026-10-15).
+        days: How many calendar days back from iso_date (default 7).
     """
     try:
-        payload = retrieve_recent_construction_accidents(month_day, days=days)
+        payload = retrieve_recent_construction_accidents(iso_date, days=days)
     except KnowledgeBaseError as exc:
         return f"[ERROR] {exc}"
     except ValueError as exc:
@@ -822,12 +871,13 @@ def search_recent_construction_accidents(month_day: str, days: int = 7) -> str:
         return f"[ERROR] 近日建築地盤意外檢索失敗：{exc}"
 
     window = int(payload.get("days") or days)
+    span = f"{payload.get('start_iso')}～{payload.get('end_iso')}"
     if payload.get("source") == "local" and payload.get("hits"):
-        neighbour = (payload["hits"][0].get("metadata") or {}).get("month_day") or ""
+        hit_iso = (payload["hits"][0].get("metadata") or {}).get("iso_date") or ""
         header = (
-            f"[HITS] 當日（{payload['month_day']}）前三層無結果；"
-            f"改從近 {window} 日內的本地地盤／建築相關意外召回"
-            f"（命中月日 {neighbour}）。以下為原文（繁體中文，未經翻譯）：\n\n"
+            f"[HITS] 當日（{payload['iso_date']}）前三層無結果；"
+            f"改從近 {window} 個日曆日（{span}）內的本地地盤／建築相關意外召回"
+            f"（命中日期 {hit_iso}）。以下為原文（繁體中文，未經翻譯）：\n\n"
         )
         return header + _format_rag_hits(payload["hits"])
 
@@ -840,14 +890,15 @@ def search_recent_construction_accidents(month_day: str, days: int = 7) -> str:
     results = payload.get("web_results") or []
     if results:
         header = (
-            f"[WEB_HITS] 當日（{payload['month_day']}）前三層無結果；"
-            f"改召回近日建築／地盤相關工作意外。查詢：{payload.get('web_query')}\n\n"
+            f"[WEB_HITS] 當日（{payload['iso_date']}）前三層無結果；"
+            f"改召回近 {window} 個日曆日（{span}）的建築／地盤相關工作意外。"
+            f"查詢：{payload.get('web_query')}\n\n"
         )
         return header + _format_web_hits(results)
 
     return (
-        f"[NO_HITS] 近 {window} 日內本地與網上均沒有找到可用的建築／地盤相關意外。"
-        f"中心月日：{payload.get('month_day', month_day)}。"
+        f"[NO_HITS] 近 {window} 個日曆日（{span}）內本地與網上均沒有找到"
+        f"可用的建築／地盤相關意外。基準日：{payload.get('iso_date', iso_date)}。"
     )
 
 
@@ -919,13 +970,14 @@ Tool / fallback rules (do not describe these rules in the user-visible answer):
       If [HITS] → write the notice from that official source, then stop.
    ③ If Labour Department also returns [NO_HITS] → call search_web for worldwide workplace / industrial accidents on that day.
       If found → write the notice, then stop.
-   ④ If levels ①–③ all miss → call search_recent_construction_accidents to recall a construction /
-      building-site accident from nearby days (local PPT neighbours first, then recent web).
-      Never search for "on this day in history" / 歷史上的今天 / historical trivia.
+   ④ If levels ①–③ all miss → call search_recent_construction_accidents(iso_date=YYYY-MM-DD)
+      to recall a construction / building-site accident from the last few *calendar* days
+      relative to that date (usually the same year). Example: 2026-10-15 → 2026-10-08…2026-10-15.
+      Do NOT use historical neighbouring MM-DDs from other years. Never search 歷史上的今天.
 3. Date guardrail for levels ①–③: only use an incident whose event date is the requested MM-DD.
    Reject nearby dates (9.17 when asking 9.16) even if the text contains 16 or 17 as a count, age, or year fragment.
    When calling search_web for level ③, pass month_day and write the date in several forms (9月16日, 09-16, 9.16, 16 September).
-   Level ④ is the exception: nearby / recent construction accidents are allowed.
+   Level ④ is the exception: real recent calendar dates (same year), not historical MM-DD neighbours.
 4. Notice structure: title with layer, date and place, summary, 2–4 practical safety reminders, sources.
 5. Never translate or rewrite the stored PPT text in SQLite. When quoting a PPT, keep the original Traditional Chinese wording. In English output mode, quote the original then add an English paraphrase.
 6. Follow the OUTPUT_LANGUAGE tag in the latest user message:
@@ -1067,8 +1119,10 @@ def daily_alert_user_prompt(target: date, language: str = "zh-Hant") -> str:
         f"{month}月{day}日 {month}.{day} {day} {_EN_MONTHS[month]} 工業意外 工作意外 工傷。"
         f"只用 {month_day} 當日的意外。\n"
         f"④ 若前三層都沒有，呼叫 search_recent_construction_accidents，"
-        f"month_day={month_day}，days={RECENT_CONSTRUCTION_DAYS}，"
-        f"召回近幾日的建築／地盤相關意外。禁止搜尋「歷史上的今天」或歷史冷知識。\n"
+        f"iso_date={target.isoformat()}，days={RECENT_CONSTRUCTION_DAYS}，"
+        f"召回與今日同一年份、日曆上近幾日的建築／地盤相關意外"
+        f"（例如往前 {RECENT_CONSTRUCTION_DAYS} 天），不是歷史相同月日的鄰近日子。"
+        f"禁止搜尋「歷史上的今天」或歷史冷知識。\n"
         f"{closing}"
     )
 
@@ -1499,7 +1553,7 @@ def generate_short_reminder(
     month_day = to_month_day(target)
     iso_date = target.isoformat()
 
-    pipeline = run_priority_pipeline(month_day)
+    pipeline = run_priority_pipeline(month_day, center_date=target)
     evidence = str(pipeline.get("evidence") or "")[:4000]
     level_label = str(pipeline.get("label") or "")
     news = _extract_primary_news(evidence)
@@ -1644,13 +1698,19 @@ def infer_fallback_level(trace: list[str], text: str) -> str:
     return "unknown"
 
 
-def run_priority_pipeline(month_day: str) -> dict[str, Any]:
+def run_priority_pipeline(
+    month_day: str,
+    *,
+    center_date: date | None = None,
+) -> dict[str, Any]:
     """
     Deterministic 4-level fallback used by the testing guide / Discord path.
 
     This does not rely on the LLM choosing tools; it calls the tools in order.
+    Level 4 uses real calendar days around center_date (default: HK today).
     """
     month_day = normalize_month_day(month_day)
+    center = center_date or today_in_hong_kong()
 
     level1 = search_local_work_accidents.invoke({"month_day": month_day, "extra_query": "工業意外"})
     if level1.startswith("[HITS]"):
@@ -1669,7 +1729,7 @@ def run_priority_pipeline(month_day: str) -> dict[str, Any]:
         return {"level": 3, "label": "③ 全球工作意外", "evidence": level3}
 
     level4 = search_recent_construction_accidents.invoke(
-        {"month_day": month_day, "days": RECENT_CONSTRUCTION_DAYS}
+        {"iso_date": center.isoformat(), "days": RECENT_CONSTRUCTION_DAYS}
     )
     return {"level": 4, "label": "④ 近日建築地盤意外", "evidence": level4}
 
@@ -1747,7 +1807,7 @@ def main() -> None:
 
     if args.test_fallback:
         print(f"[test] Target date: {target.isoformat()}  MM-DD={to_month_day(target)}")
-        result = run_priority_pipeline(to_month_day(target))
+        result = run_priority_pipeline(to_month_day(target), center_date=target)
         print(f"[test] Fired level: {result['label']}")
         print(result["evidence"][:4000])
         return
@@ -1800,9 +1860,9 @@ if __name__ == "__main__":
 #   for the same MM-DD. Watch the printed evidence / Streamlit tool trace.
 #
 # Level ④ Recent construction accident recall:
-#   If levels 1–3 all miss, call search_recent_construction_accidents:
-#   nearby MM-DD construction events in SQLite first, then recent web construction
-#   / site accidents. Do NOT search 「歷史上的今天」.
+#   If levels 1–3 all miss, call search_recent_construction_accidents(iso_date=...):
+#   real calendar days in the same year (e.g. past 7 days), local SQLite by iso_date
+#   first, then web. NOT historical neighbouring MM-DDs. Do NOT search 「歷史上的今天」.
 #
 # Empty / error handling checks:
 #   - Delete or rename data/events.db then call local search → [ERROR] asking you to ingest first.

@@ -58,8 +58,8 @@ ACCIDENT_KEYWORDS = (
     "fatal accident",
 )
 
-# Level-4 fallback: recall construction-related accidents within ±N calendar days
-# (MM-DD neighbours), when same-day levels 1–3 all miss.
+# Level-4 fallback: recall construction accidents from the past N *real* calendar
+# days relative to the alert date (usually same year), when levels 1–3 all miss.
 RECENT_CONSTRUCTION_DAYS = int(os.getenv("RECENT_CONSTRUCTION_DAYS", "7"))
 CONSTRUCTION_KEYWORDS = (
     "地盤",
