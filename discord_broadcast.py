@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from datetime import date
 from zoneinfo import ZoneInfo
@@ -145,19 +146,26 @@ class DetailView(discord.ui.View):
         self.add_item(DetailButton(iso_date))
 
 
+def _detail_too_thin(detail: str) -> bool:
+    """True when cached 閱讀全文 is only a headline-sized blurb."""
+    body = re.sub(r"^日期：[^\n]*\n*", "", (detail or "").strip())
+    return len(re.findall(r"[\u4e00-\u9fff]", body)) < 80
+
+
 async def _send_detail_response(interaction: discord.Interaction, iso_date: str) -> None:
     detail = get_cached_detail(iso_date)
-    if not detail:
-        # Fallback: regenerate for that calendar day if cache was wiped.
+    if not detail or _detail_too_thin(detail):
+        # Regenerate when cache missing or still title-only (e.g. old Labour hits).
         try:
             reminder = await asyncio.to_thread(
                 generate_short_reminder,
                 date.fromisoformat(iso_date),
             )
-            detail = reminder.get("detail_text") or "（暫無詳細資料）"
+            detail = reminder.get("detail_text") or detail or "（暫無詳細資料）"
             cache_detail(iso_date, detail)
         except Exception as exc:  # noqa: BLE001
-            detail = f"無法載入 {iso_date} 的事件詳情：{exc}"
+            if not detail:
+                detail = f"無法載入 {iso_date} 的事件詳情：{exc}"
 
     chunks = split_discord_chunks(detail)
     await interaction.response.send_message(chunks[0], ephemeral=True)
@@ -244,6 +252,7 @@ class SafetyBot(discord.Client):
 
         print("[discord] Posted to channel.")
         print(f"[discord] date={reminder['iso_date']} chars={reminder['char_count']}")
+        print(f"[discord] level={reminder.get('level_label') or '（未知）'}")
         print(f"[discord] text={reminder['text']}")
         print(f"[discord] message_id={message.id}")
         if reminder.get("error"):

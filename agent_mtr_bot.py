@@ -12,7 +12,7 @@ Priority (stop at the first hit):
   1. Local SQLite: working accidents on the same MM-DD in previous years
   2. Labour Department news: https://www.labour.gov.hk/tc/major/content.php
   3. Web: working accidents around the world on this day
-  4. Web: interesting historical facts on this day
+  4. Recall recent construction-related accidents (nearby MM-DD / recent web)
 
 All user-facing answers are Traditional Chinese. PPT source text is never translated.
 """
@@ -52,13 +52,15 @@ from config import (
     AZURE_OPENAI_API_VERSION,
     AZURE_OPENAI_DEPLOYMENT,
     AZURE_OPENAI_ENDPOINT,
+    CONSTRUCTION_KEYWORDS,
     EVENTS_DB_PATH,
     HONG_KONG_TZ,
     LABOUR_DEPT_DOMAINS,
     LABOUR_DEPT_NEWS_URL,
+    RECENT_CONSTRUCTION_DAYS,
 )
 from document_ingest import parse_event_date
-from events_db import db_ready, fetch_by_month_day
+from events_db import db_ready, fetch_by_month_day, fetch_nearby_construction_events
 from multi_search_api import SmartSearchTool
 
 _MONTH_DAY_RE = re.compile(r"^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$")
@@ -428,6 +430,12 @@ def is_work_accident_related(text: str) -> bool:
     return any(keyword.lower() in lower for keyword in ACCIDENT_KEYWORDS)
 
 
+def is_construction_related(text: str) -> bool:
+    """True if the text looks like a construction / building-site accident."""
+    lower = (text or "").lower()
+    return any(keyword.lower() in lower for keyword in CONSTRUCTION_KEYWORDS)
+
+
 def ensure_events_db() -> None:
     """Raise if the SQLite events DB has not been built yet."""
     if not db_ready(EVENTS_DB_PATH):
@@ -718,17 +726,143 @@ def search_labour_department(month_day: str, extra_query: str = "") -> str:
     return header + _format_web_hits(payload["results"])
 
 
+def retrieve_recent_construction_accidents(
+    month_day: str,
+    *,
+    days: int | None = None,
+) -> dict[str, Any]:
+    """
+    Level-4 recall: construction accidents on nearby MM-DDs in the local DB,
+    then (if empty) recent construction accidents on the open web.
+    """
+    month_day = normalize_month_day(month_day)
+    window = int(days if days is not None else RECENT_CONSTRUCTION_DAYS)
+    candidates: list[dict[str, Any]] = []
+    try:
+        ensure_events_db()
+        candidates = fetch_nearby_construction_events(
+            month_day,
+            days=window,
+            keywords=CONSTRUCTION_KEYWORDS,
+        )
+    except KnowledgeBaseError:
+        candidates = []
+    if candidates:
+        event = random.choice(candidates)
+        hit = {
+            "content": event["content"],
+            "metadata": {
+                "id": event.get("id"),
+                "iso_date": event["iso_date"],
+                "month_day": event["month_day"],
+                "title": event["title"],
+                "location": event["location"],
+                "category": event["category"],
+                "source_file": event["source_file"],
+                "slide_number": event["slide_number"],
+                "language": event["language"],
+                "recall": "nearby_construction",
+            },
+        }
+        return {
+            "month_day": month_day,
+            "days": window,
+            "source": "local",
+            "hits": [hit],
+            "candidate_count": len(candidates),
+            "web_results": [],
+        }
+
+    web_query = (
+        "香港 近日 地盤 建築 工程 工業意外 工作意外 "
+        "Hong Kong recent construction site workplace accident"
+    )
+    payload = web_search(web_query)
+    results = [
+        item
+        for item in (payload.get("results") or [])
+        if is_construction_related(_web_item_blob(item))
+        and is_work_accident_related(_web_item_blob(item))
+    ]
+    return {
+        "month_day": month_day,
+        "days": window,
+        "source": "web" if results else "none",
+        "hits": [],
+        "candidate_count": 0,
+        "web_results": results,
+        "web_status": payload.get("status"),
+        "web_error": payload.get("error"),
+        "web_query": web_query,
+    }
+
+
+@tool
+def search_recent_construction_accidents(month_day: str, days: int = 7) -> str:
+    """Recall construction-related accidents from recent / nearby days.
+
+    Use ONLY as layer ④ after local same-day, Labour Department, and world
+    same-day workplace searches all returned NO_HITS / EMPTY_SEARCH.
+
+    First searches the local PPT SQLite for construction accidents on nearby
+    MM-DDs (±days, excluding the exact day). If none, searches the web for
+    recent Hong Kong construction / site accidents (no same-day date filter).
+
+    Args:
+        month_day: Centre month-day MM-DD (example: 10-15).
+        days: Neighbour window in calendar days (default 7).
+    """
+    try:
+        payload = retrieve_recent_construction_accidents(month_day, days=days)
+    except KnowledgeBaseError as exc:
+        return f"[ERROR] {exc}"
+    except ValueError as exc:
+        return f"[ERROR] 日期格式無效：{exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"[ERROR] 近日建築地盤意外檢索失敗：{exc}"
+
+    window = int(payload.get("days") or days)
+    if payload.get("source") == "local" and payload.get("hits"):
+        neighbour = (payload["hits"][0].get("metadata") or {}).get("month_day") or ""
+        header = (
+            f"[HITS] 當日（{payload['month_day']}）前三層無結果；"
+            f"改從近 {window} 日內的本地地盤／建築相關意外召回"
+            f"（命中月日 {neighbour}）。以下為原文（繁體中文，未經翻譯）：\n\n"
+        )
+        return header + _format_rag_hits(payload["hits"])
+
+    if payload.get("web_status") == "api_error":
+        return (
+            f"[API_ERROR] 近日建築地盤意外網搜失敗："
+            f"{payload.get('web_error', 'unknown error')}"
+        )
+
+    results = payload.get("web_results") or []
+    if results:
+        header = (
+            f"[WEB_HITS] 當日（{payload['month_day']}）前三層無結果；"
+            f"改召回近日建築／地盤相關工作意外。查詢：{payload.get('web_query')}\n\n"
+        )
+        return header + _format_web_hits(results)
+
+    return (
+        f"[NO_HITS] 近 {window} 日內本地與網上均沒有找到可用的建築／地盤相關意外。"
+        f"中心月日：{payload.get('month_day', month_day)}。"
+    )
+
+
 @tool
 def search_web(query: str, month_day: str = "") -> str:
     """Search the live web with Serper. Use this only after BOTH local RAG and
     search_labour_department returned NO_HITS (or for follow-up questions).
 
     Write the target date in several forms in the query (9月16日, 09-16, 9.16,
-    16 September). Hits that are not that same MM-DD are dropped.
+    16 September). Hits that are not that same MM-DD are dropped when month_day
+    is provided.
 
     Suggested queries by fallback level:
       Level 3: world working / industrial / workplace accident on this day in history.
-      Level 4: interesting historical facts / 歷史上的今天 on this day.
+      Level 4: do NOT use this tool — call search_recent_construction_accidents instead.
 
     Args:
         query: Search query. Include the month-day written in several forms.
@@ -785,17 +919,20 @@ Tool / fallback rules (do not describe these rules in the user-visible answer):
       If [HITS] → write the notice from that official source, then stop.
    ③ If Labour Department also returns [NO_HITS] → call search_web for worldwide workplace / industrial accidents on that day.
       If found → write the notice, then stop.
-   ④ If no workplace accident of any kind is found → call search_web for "on this day in history" and output that fact.
-3. Date guardrail: only use an incident whose event date is the requested MM-DD.
+   ④ If levels ①–③ all miss → call search_recent_construction_accidents to recall a construction /
+      building-site accident from nearby days (local PPT neighbours first, then recent web).
+      Never search for "on this day in history" / 歷史上的今天 / historical trivia.
+3. Date guardrail for levels ①–③: only use an incident whose event date is the requested MM-DD.
    Reject nearby dates (9.17 when asking 9.16) even if the text contains 16 or 17 as a count, age, or year fragment.
-   When calling search_web, pass month_day and write the date in several forms (9月16日, 09-16, 9.16, 16 September).
+   When calling search_web for level ③, pass month_day and write the date in several forms (9月16日, 09-16, 9.16, 16 September).
+   Level ④ is the exception: nearby / recent construction accidents are allowed.
 4. Notice structure: title with layer, date and place, summary, 2–4 practical safety reminders, sources.
 5. Never translate or rewrite the stored PPT text in SQLite. When quoting a PPT, keep the original Traditional Chinese wording. In English output mode, quote the original then add an English paraphrase.
 6. Follow the OUTPUT_LANGUAGE tag in the latest user message:
    - zh-Hant: every user-visible sentence must be Traditional Chinese (Hong Kong wording). No English sentences. No English process notes. Proper nouns such as ICU may stay as-is.
    - en: every user-visible sentence must be English, except original PPT quotes.
 7. The final answer must NEVER contain process / debug narration, including:
-   "Level ①/②/③/④ returned...", "I'll output the historical fact", "Since no workplace accident was found",
+   "Level ①/②/③/④ returned...", "I'll recall a recent construction accident", "Since no workplace accident was found",
    "依規則在此停止", tool names, [HITS], [NO_HITS], [WEB_HITS], [EMPTY_SEARCH].
    Those belong only in internal tool use, not in the text shown to the user.
 """
@@ -805,14 +942,17 @@ LEVEL_LABELS = {
     "labour_dept": {"zh-Hant": "② 勞工處新聞公報", "en": "② Labour Department press release"},
     "hk_web": {"zh-Hant": "② 勞工處新聞公報", "en": "② Labour Department press release"},
     "world_web": {"zh-Hant": "③ 全球工作意外", "en": "③ Worldwide workplace accident"},
-    "history": {"zh-Hant": "④ 歷史冷知識", "en": "④ Historical fact"},
+    "recent_construction": {
+        "zh-Hant": "④ 近日建築地盤意外",
+        "en": "④ Recent construction accident",
+    },
     "unknown": {"zh-Hant": "安全警示", "en": "Safety alert"},
 }
 
 _PROCESS_LINE_RE = re.compile(
-    r"(?im)^(?:\s*(?:level\s*[①②③④1-4]|layer\s*[1-4]).*(?:returned|usable|historical fact).*|"
+    r"(?im)^(?:\s*(?:level\s*[①②③④1-4]|layer\s*[1-4]).*(?:returned|usable|historical fact|construction).*|"
     r".*since no workplace accident was found.*|"
-    r".*i(?:'|’)?ll output the historical fact.*|"
+    r".*i(?:'|’)?ll (?:output the historical fact|recall a recent construction).*|"
     r".*no workplace accident was found at any level.*|"
     r".*依規則在此停止.*|"
     r".*不再搜尋網絡.*|"
@@ -840,7 +980,7 @@ def language_instruction(language: str) -> str:
     return (
         "OUTPUT_LANGUAGE=zh-Hant\n"
         "給使用者看的全部文字必須是繁體中文，不可夾雜英文句子或英文過程說明。"
-        "禁止寫出 Level ④ returned...、I'll output... 這類後台語句。"
+        "禁止寫出 Level ④ returned...、I'll recall... 這類後台語句。"
         "不要提及工具名稱或搜尋過程。"
     )
 
@@ -883,7 +1023,12 @@ def build_agent():
         return _agent
 
     llm = build_llm()
-    tools = [search_local_work_accidents, search_labour_department, search_web]
+    tools = [
+        search_local_work_accidents,
+        search_labour_department,
+        search_web,
+        search_recent_construction_accidents,
+    ]
     try:
         _agent = _create_agent(
             model=llm,
@@ -906,9 +1051,9 @@ def daily_alert_user_prompt(target: date, language: str = "zh-Hant") -> str:
     day = target.day
     language = normalize_output_language(language)
     closing = (
-        "Write only the user-visible English safety notice or historical fact. No process narration."
+        "Write only the user-visible English safety notice. No process narration."
         if language == "en"
-        else "最後只輸出給使用者看的繁體中文警示或史實，不要寫任何英文過程說明。"
+        else "最後只輸出給使用者看的繁體中文安全警示，不要寫任何英文過程說明。"
     )
     return (
         f"{language_instruction(language)}\n\n"
@@ -921,9 +1066,9 @@ def daily_alert_user_prompt(target: date, language: str = "zh-Hant") -> str:
         f"world workplace industrial working accident on {month_day} in history "
         f"{month}月{day}日 {month}.{day} {day} {_EN_MONTHS[month]} 工業意外 工作意外 工傷。"
         f"只用 {month_day} 當日的意外。\n"
-        f"④ 若完全沒有工作意外，呼叫 search_web，month_day={month_day}，查："
-        f"historical events on {month_day} interesting facts 歷史上的今天 "
-        f"{month}月{day}日 {month}.{day}。\n"
+        f"④ 若前三層都沒有，呼叫 search_recent_construction_accidents，"
+        f"month_day={month_day}，days={RECENT_CONSTRUCTION_DAYS}，"
+        f"召回近幾日的建築／地盤相關意外。禁止搜尋「歷史上的今天」或歷史冷知識。\n"
         f"{closing}"
     )
 
@@ -1140,6 +1285,24 @@ def _looks_like_source_list(text: str) -> bool:
     return numbered >= 3 and "意外簡述" not in text
 
 
+_LEVEL_LEAK_RE = re.compile(
+    r"(?m)^(?:\s*(?:【)?(?:來源)?層級[:：].*$|"
+    r"\s*Level\s*[①②③④1-4].*$|"
+    r"\s*[①②③④]\s*(?:本地|勞工處|全球|近日|歷史).*$)"
+)
+
+
+def _strip_level_leaks(text: str) -> str:
+    """Remove any leaked fallback-level lines from worker-facing copy."""
+    cleaned = _LEVEL_LEAK_RE.sub("", text or "")
+    cleaned = re.sub(
+        r"(來源層級|備援層級|前三層|Level\s*[①②③④1-4]|[①②③④]\s*本地 PPT)",
+        "",
+        cleaned,
+    )
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
 def _is_mostly_traditional_chinese(text: str) -> bool:
     """True when the body is mainly CJK (safe to show workers without rewrite)."""
     if not (text or "").strip():
@@ -1152,6 +1315,84 @@ def _is_mostly_traditional_chinese(text: str) -> bool:
     if cjk < 40:
         return cjk >= max(8, latin)
     return cjk >= latin * 2
+
+
+def _cjk_len(text: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _is_thin_incident_source(text: str) -> bool:
+    """
+    True when the source is only a headline / press-title, not a usable story.
+
+    Labour Department listing hits are typically one-line titles — too thin for
+    「閱讀全文」, so we must enrich or rewrite before showing workers.
+    """
+    body = (text or "").strip()
+    if not body:
+        return True
+    if _looks_like_source_list(body):
+        return True
+    # Structured PPT clippings usually have 意外簡述 / multi-line place+story.
+    if "意外簡述" in body or "地點" in body:
+        return _cjk_len(body) < 60
+    # Pure press titles / short blurbs.
+    if _cjk_len(body) < 100:
+        return True
+    if body.count("\n") < 2 and _cjk_len(body) < 160:
+        return True
+    return False
+
+
+def _enrich_thin_incident(
+    seed: str,
+    *,
+    iso_date: str,
+    month_day: str,
+) -> str:
+    """Web-search for fuller case details when the primary hit is only a title."""
+    seed = (seed or "").strip()
+    # Prefer the first meaningful Chinese headline as the query core.
+    headline = ""
+    for line in seed.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("網址") or stripped.startswith("http"):
+            continue
+        if re.match(r"^\[\d+\]", stripped):
+            stripped = re.sub(r"^\[\d+\]\s*", "", stripped)
+        if _cjk_len(stripped) >= 8:
+            headline = stripped[:80]
+            break
+    date_bits = " ".join(date_keyword_variants(month_day, with_years=False))
+    year = iso_date.split("-")[0] if iso_date else ""
+    query = " ".join(
+        part
+        for part in (
+            headline or "香港 工作意外 工業意外",
+            year,
+            date_bits,
+            "香港 工作意外 地盤 工業意外 詳情",
+        )
+        if part
+    )
+    try:
+        payload = web_search(query)
+    except Exception:  # noqa: BLE001
+        return seed
+    if payload.get("status") != "ok":
+        return seed
+    results = [
+        item
+        for item in (payload.get("results") or [])
+        if is_work_accident_related(_web_item_blob(item))
+    ]
+    if not results:
+        return seed
+    # Keep Serper snippets; do not re-apply same-day filter (listing titles often
+    # lack full dates in the snippet, and we already keyed the query by date).
+    blocks = [seed, "", "—— 補充報道 ——", ""]
+    blocks.append(_format_web_hits(results[:4]))
+    return "\n".join(blocks).strip()
 
 
 def _fallback_short_from_news(news: str, iso_date: str) -> str:
@@ -1214,8 +1455,10 @@ def _rewrite_article_to_zh_hant(
         "硬性要求：\n"
         "1. 全文必須是繁體中文，禁止英文句子或英文段落。\n"
         "2. 只寫這一起事件／事實的經過；不要網址、搜尋結果清單、[HITS]、來源檔案。\n"
-        "3. 不得捏造資料沒有的事實。\n"
-        "4. 只輸出報道正文本身，不要標題標記。\n"
+        "3. 不得捏造資料沒有的事實；資料只有標題時，可寫已知地點與「致命／受傷」等標題已載明資訊，"
+        "並說明當局跟進，但不要編造人名、年齡、精確傷勢。\n"
+        "4. 必須比一句標題更詳細（至少交代地點、事件性質、後果或跟進）。\n"
+        "5. 只輸出報道正文本身，不要標題標記。\n"
         f"查詢日期：{iso_date}\n"
         f"資料：\n{(source or fallback)[:3500]}\n"
     )
@@ -1226,18 +1469,20 @@ def _rewrite_article_to_zh_hant(
         if isinstance(raw, list):
             raw = "".join(str(part) for part in raw)
         text = str(raw).strip()
-        if _is_mostly_traditional_chinese(text):
+        if _is_mostly_traditional_chinese(text) and not _is_thin_incident_source(text):
+            return text
+        if _is_mostly_traditional_chinese(text) and _cjk_len(text) >= 80:
             return text
     except Exception:  # noqa: BLE001
         pass
-    # Last resort: never show raw English to workers.
-    if _is_mostly_traditional_chinese(fallback):
+    # Last resort: never show raw English / title-only dumps to workers.
+    if _is_mostly_traditional_chinese(fallback) and not _is_thin_incident_source(fallback):
         return fallback.strip()
-    if _is_mostly_traditional_chinese(source):
+    if _is_mostly_traditional_chinese(source) and not _is_thin_incident_source(source):
         return source
     return (
-        f"{_iso_to_zh_date(iso_date)}，往年同日有相關紀錄，"
-        "惟暫未能以繁體中文整理詳細案情。請留意職安風險並遵守安全程序。"
+        f"{_iso_to_zh_date(iso_date)}，有關當局公布發生工作意外並展開跟進。"
+        "詳細案情仍在調查中。請在高危工序前評估風險，佩戴適當防護裝備，並嚴格遵守安全程序。"
     )
 
 
@@ -1258,22 +1503,37 @@ def generate_short_reminder(
     evidence = str(pipeline.get("evidence") or "")[:4000]
     level_label = str(pipeline.get("label") or "")
     news = _extract_primary_news(evidence)
-    # Always rewrite into Traditional Chinese when source is English / a URL dump.
+    # Labour / web hits are often titles only — enrich before writing ARTICLE.
+    if _is_thin_incident_source(news or evidence):
+        enriched = _enrich_thin_incident(
+            news or evidence,
+            iso_date=iso_date,
+            month_day=month_day,
+        )
+        if enriched and enriched != (news or evidence):
+            evidence = enriched[:4500]
+            news = _extract_primary_news(evidence) or news
+    # Always rewrite when source is English, a URL dump, or too thin for 閱讀全文.
     must_rewrite = (
         not news
         or _looks_like_source_list(news)
         or not _is_mostly_traditional_chinese(news)
+        or _is_thin_incident_source(news)
     )
 
     prompt = (
         "你是香港職安新聞編輯。\n"
         "硬性語言要求：INCIDENT、TIP、ARTICLE 三部分的全部文字必須是繁體中文（香港用詞）。\n"
         "禁止輸出英文句子或英文段落；若資料是英文／其他語言，必須改寫成繁體中文後再輸出。\n"
+        "絕對不要寫備援層級、來源層級、①②③④、Level、前三層、本地 PPT、勞工處公報、網搜過程等後台字眼；"
+        "這些只供系統內部使用，不可出現在給員工看的文字。\n"
         "只輸出以下三個標記，不要其他說明：\n"
         "INCIDENT: （一句案情。必須包含日期、地點、發生了甚麼、主要原因（資料有則寫）。"
         "例如：2023年4月4日，港鐵灣仔站有維修工因未注意路軌環境跌倒受傷。）\n"
         "TIP: （一句可執行的安全提醒，約20至40字，繁體中文。）\n"
         "ARTICLE: （一篇約150至400字的繁體中文新聞報道，只寫這一起事件的經過。"
+        "必須比 INCIDENT 更詳細：交代地點、人員／工種、經過、傷勢或後果、已知原因（資料有則寫）。"
+        "若資料只有標題，可據標題與補充報道合理整理，但不得捏造具體人名或無根據細節。"
         "只寫日期與案情正文。不要寫[HITS]、來源檔案、來源層級、分類、資料來源、網址清單。）\n"
         f"今日查詢日期：{iso_date}（月日 {month_day}）\n"
         f"資料：\n{news or evidence}\n"
@@ -1314,15 +1574,16 @@ def generate_short_reminder(
         )
 
     if must_rewrite:
+        # Prefer the long ARTICLE for 閱讀全文; never leave workers with a title only.
         article = written_article
-        if not _is_mostly_traditional_chinese(article):
+        if _is_thin_incident_source(article) or not _is_mostly_traditional_chinese(article):
             article = _rewrite_article_to_zh_hant(
                 news or evidence,
                 iso_date=iso_date,
                 fallback=written_article or news,
             )
-    elif _is_mostly_traditional_chinese(news):
-        # Keep original Traditional Chinese PPT wording for workers.
+    elif _is_mostly_traditional_chinese(news) and not _is_thin_incident_source(news):
+        # Keep original Traditional Chinese PPT wording when it is a full story.
         article = news
     else:
         article = written_article or news or "（暫無詳細新聞內容）"
@@ -1330,10 +1591,11 @@ def generate_short_reminder(
     if not (article or "").strip():
         article = "（暫無詳細新聞內容）"
 
-    # 「閱讀全文」 final gate: never show non-Chinese / source dumps.
+    # 「閱讀全文」 final gate: never show non-Chinese / source dumps / thin titles.
     if (
         not _is_mostly_traditional_chinese(article)
         or _looks_like_source_list(article)
+        or _is_thin_incident_source(article)
     ):
         article = _rewrite_article_to_zh_hant(
             news or evidence or article,
@@ -1343,6 +1605,9 @@ def generate_short_reminder(
 
     event_iso = _event_iso_from_news(news or article, iso_date)
     detail_text = _clean_worker_article(article, event_iso)
+    # Worker-facing Discord text never includes the fallback level; logs only.
+    text = _strip_level_leaks(text)
+    detail_text = _strip_level_leaks(detail_text)
 
     return {
         "text": text,
@@ -1359,12 +1624,13 @@ def infer_fallback_level(trace: list[str], text: str) -> str:
     """Best-effort key for which fallback level produced the answer."""
     rag_called = any("search_local_work_accidents" in step for step in trace)
     labour_called = any("search_labour_department" in step for step in trace)
+    recent_called = any("search_recent_construction_accidents" in step for step in trace)
     web_calls = [step for step in trace if step.startswith("search_web")]
+    if recent_called:
+        return "recent_construction"
     if rag_called and not labour_called and not web_calls:
         return "local"
     joined = " ".join(web_calls).lower() + " " + text
-    if any(token in joined for token in ("歷史上的今天", "historical events", "interesting facts", "冷知識")):
-        return "history"
     if any(token in joined for token in ("world workplace", "industrial working accident", "全球工作意外", "全球工業意外")):
         return "world_web"
     if labour_called and not web_calls:
@@ -1380,9 +1646,9 @@ def infer_fallback_level(trace: list[str], text: str) -> str:
 
 def run_priority_pipeline(month_day: str) -> dict[str, Any]:
     """
-    Deterministic 4-level fallback used by the testing guide.
+    Deterministic 4-level fallback used by the testing guide / Discord path.
 
-    This does not rely on the LLM choosing tools; it calls the same two tools in order.
+    This does not rely on the LLM choosing tools; it calls the tools in order.
     """
     month_day = normalize_month_day(month_day)
 
@@ -1402,12 +1668,10 @@ def run_priority_pipeline(month_day: str) -> dict[str, Any]:
     if level3.startswith("[WEB_HITS]") and is_work_accident_related(level3):
         return {"level": 3, "label": "③ 全球工作意外", "evidence": level3}
 
-    fact_query = (
-        f"historical events on {month_day} interesting facts 歷史上的今天 "
-        f"{' '.join(date_keyword_variants(month_day, with_years=False))}"
+    level4 = search_recent_construction_accidents.invoke(
+        {"month_day": month_day, "days": RECENT_CONSTRUCTION_DAYS}
     )
-    level4 = search_web.invoke({"query": fact_query, "month_day": month_day})
-    return {"level": 4, "label": "④ 歷史冷知識", "evidence": level4}
+    return {"level": 4, "label": "④ 近日建築地盤意外", "evidence": level4}
 
 
 def interactive_chat(start_date: date, language: str = "zh-Hant") -> None:
@@ -1535,10 +1799,10 @@ if __name__ == "__main__":
 #   search_web call must be a global workplace / industrial accident query
 #   for the same MM-DD. Watch the printed evidence / Streamlit tool trace.
 #
-# Level ④ Historical fact:
-#   If levels 1–3 all miss, the last search_web query must be "historical events" /
-#   「歷史上的今天」. The user-facing output is still Traditional Chinese, but it is
-#   a fact rather than a workplace safety notice.
+# Level ④ Recent construction accident recall:
+#   If levels 1–3 all miss, call search_recent_construction_accidents:
+#   nearby MM-DD construction events in SQLite first, then recent web construction
+#   / site accidents. Do NOT search 「歷史上的今天」.
 #
 # Empty / error handling checks:
 #   - Delete or rename data/events.db then call local search → [ERROR] asking you to ingest first.

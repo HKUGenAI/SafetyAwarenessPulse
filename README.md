@@ -2,14 +2,14 @@
 
 A LangChain agent that posts a **daily workplace safety alert** in Traditional Chinese.
 
-It first looks up working accidents that happened on the same month-day (`MM-DD`) in a local SQLite events database built from four Traditional Chinese PowerPoint newspaper-cutting decks. If nothing is found, it searches the [Hong Kong Labour Department press-release list](https://www.labour.gov.hk/tc/major/content.php), then falls back to worldwide workplace accidents, then historical facts.
+It first looks up working accidents that happened on the same month-day (`MM-DD`) in a local SQLite events database built from four Traditional Chinese PowerPoint newspaper-cutting decks. If nothing is found, it searches the [Hong Kong Labour Department press-release list](https://www.labour.gov.hk/tc/major/content.php), then falls back to worldwide workplace accidents, then recalls recent construction / site accidents from nearby days.
 
 ## Architecture
 
 | Layer | Choice |
 | --- | --- |
 | LLM | Azure OpenAI `gpt-5.4-mini` via [`langchain-openai`](https://pypi.org/project/langchain-openai/) (`AzureChatOpenAI`) |
-| Agent | LangChain `create_agent` with three tools |
+| Agent | LangChain `create_agent` with four tools |
 | Event store | Local **SQLite** (`data/events.db`); one row per accident; lookup by `month_day` |
 
 | PPT parsing | `python-pptx` (original Traditional Chinese text is **not** translated) |
@@ -22,7 +22,7 @@ It first looks up working accidents that happened on the same month-day (`MM-DD`
 1. **Local SQLite** — `WHERE month_day = MM-DD` against events ingested from the 4 PPTs.
 2. **Labour Department press releases** — search [labour.gov.hk news](https://www.labour.gov.hk/tc/major/content.php) for workplace accidents on this day.
 3. **World workplace web search** — lookup for working accidents worldwide on this day.
-4. **Historical fact** — if no working accident is found, search for an interesting fact on this day in previous years.
+4. **Recent construction recall** — if levels 1–3 miss, recall a construction / building-site accident from nearby `MM-DD` days in SQLite (±7 by default), else recent construction accidents on the web.
 
 All **user-facing** answers are Traditional Chinese. Retrieved PPT wording is kept in the original Traditional Chinese; it is never translated.
 
@@ -37,7 +37,7 @@ SafetyAwarenessPulse/
 ├── events_db.py              # SQLite schema + date lookups
 ├── document_ingest.py        # Load PPT slides → structured events → SQLite
 ├── multi_search_api.py       # Serper SmartSearchTool (cache + rate limits)
-├── agent_mtr_bot.py          # Azure OpenAI agent + three tools + CLI chatbot
+├── agent_mtr_bot.py          # Azure OpenAI agent + four tools + CLI chatbot
 ├── discord_broadcast.py      # Daily 09:00 HK Discord reminder + 閱讀全文
 ├── streamlit_app.py          # Optional local Traditional Chinese web demo
 ├── requirements.txt
@@ -165,7 +165,7 @@ http://localhost:8501/?date=2026-04-04
 In the UI:
 
 1. Pick a Hong Kong date in the sidebar and click **產生／重新產生警示**.
-2. Read the daily safety alert (or historical fact).
+2. Read the daily safety alert (same-day accident or recent construction recall).
 3. Click **點擊此警示，繼續追問**.
 4. Type follow-up questions in **想了解更多？在此提問**.
 
@@ -366,9 +366,10 @@ sudo systemctl status safety-discord
 | --- | --- |
 | `search_local_work_accidents` | Query SQLite by `month_day` (`MM-DD`). If several accidents match, **one is chosen at random**. Returns original PPT text or `[NO_HITS]`. |
 | `search_labour_department` | Search [Labour Department press releases](https://www.labour.gov.hk/tc/major/content.php) (`labour.gov.hk` only). Layer 2 after local DB. |
-| `search_web` | Web search. Used for levels 3–4 and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
+| `search_web` | Web search. Used for level 3 (same-day world workplace) and follow-up questions. Returns `[WEB_HITS]`, `[EMPTY_SEARCH]`, or `[API_ERROR]`. |
+| `search_recent_construction_accidents` | Level 4: nearby construction / site accidents in SQLite, else recent construction web results. |
 
-The Azure OpenAI model decides which tool to call. The daily-alert prompt forces this order: local SQLite first, then the Labour Department site, then world workplace search, then a historical fact.
+The Azure OpenAI model decides which tool to call. The daily-alert prompt forces this order: local SQLite first, then the Labour Department site, then world workplace search, then recent construction-accident recall.
 
 ## Date handling
 
@@ -490,9 +491,14 @@ Expect level 1 to return `[NO_HITS]`, then `search_labour_department` to query t
 
 If the Labour Department listing also has no workplace accident for that `MM-DD`, the next `search_web` query must be a **global** workplace / industrial accident search for the same day. Check the tool trace in the terminal or Streamlit expander.
 
-### Level 4 — historical fact
+### Level 4 — recent construction recall
 
-If levels 1–3 all miss, the last query is `historical events` / 歷史上的今天. The UI still answers in Traditional Chinese, but the card is a fact rather than a workplace notice. Click it and ask follow-up questions as usual.
+If levels 1–3 all miss, `search_recent_construction_accidents` runs:
+
+1. Local SQLite construction / site keywords on nearby `MM-DD` (±`RECENT_CONSTRUCTION_DAYS`, default 7)
+2. Otherwise a Serper web search for recent Hong Kong construction / site accidents (no same-day date filter)
+
+The UI remains Traditional Chinese and still frames a workplace safety notice (not trivia).
 
 ### Error-path checks
 

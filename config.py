@@ -57,3 +57,29 @@ ACCIDENT_KEYWORDS = (
     "construction accident",
     "fatal accident",
 )
+
+# Level-4 fallback: recall construction-related accidents within ±N calendar days
+# (MM-DD neighbours), when same-day levels 1–3 all miss.
+RECENT_CONSTRUCTION_DAYS = int(os.getenv("RECENT_CONSTRUCTION_DAYS", "7"))
+CONSTRUCTION_KEYWORDS = (
+    "地盤",
+    "建築",
+    "建造",
+    "工程",
+    "施工",
+    "棚架",
+    "竹棚",
+    "搭棚",
+    "拆卸",
+    "高空",
+    "墮下",
+    "塌下",
+    "吊船",
+    "升降台",
+    "裝修工程",
+    "construction",
+    "scaffolding",
+    "building site",
+    "construction site",
+    "construction accident",
+)
