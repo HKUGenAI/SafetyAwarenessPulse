@@ -1555,6 +1555,7 @@ def generate_short_reminder(
 
     pipeline = run_priority_pipeline(month_day, center_date=target)
     evidence = str(pipeline.get("evidence") or "")[:4000]
+    level = int(pipeline.get("level") or 0)
     level_label = str(pipeline.get("label") or "")
     news = _extract_primary_news(evidence)
     # Labour / web hits are often titles only — enrich before writing ARTICLE.
@@ -1668,6 +1669,7 @@ def generate_short_reminder(
         "iso_date": iso_date,
         "month_day": month_day,
         "detail_text": detail_text,
+        "level": level,
         "level_label": level_label,
         "char_count": _count_zh_chars(text),
         "error": error,

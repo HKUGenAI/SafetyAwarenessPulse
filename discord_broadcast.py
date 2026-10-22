@@ -124,6 +124,10 @@ def split_discord_chunks(text: str, limit: int = DISCORD_MSG_LIMIT) -> list[str]
 
 def build_message_text(reminder: dict) -> str:
     body = (reminder.get("text") or "").strip()
+    level = int(reminder.get("level") or 0)
+    # Levels 1–3 are historical same-day; level 4 is recent calendar days (no title).
+    if 1 <= level <= 3:
+        return f"【每日安全提醒】\n【歷史上的今日】\n{body}"
     return f"【每日安全提醒】\n{body}"
 
 
